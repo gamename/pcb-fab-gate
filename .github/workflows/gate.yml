@@ -86,7 +86,24 @@ jobs:
       - name: Checkout caller repo (board files)
         uses: actions/checkout@v4
 
+      - name: DEBUG dump github/job context (temporary, SVW-0036 diagnosis)
+        run: |
+          echo "--- github context ---"
+          cat <<'EOF_GH'
+          ${{ toJSON(github) }}
+          EOF_GH
+          echo "--- job context ---"
+          cat <<'EOF_JOB'
+          ${{ toJSON(job) }}
+          EOF_JOB
+
       - name: Checkout pcb-fab-gate tooling (pinned to this gate.yml's own commit)
+        # `github.workflow_sha` is the TOP-LEVEL calling workflow's own commit
+        # (confirmed empirically against bb-pcb, SVW-0036: it resolved to
+        # bb-pcb's PR merge commit, which doesn't exist in this repo and
+        # 404s the fetch). Diagnosing the correct self-referential field via
+        # the DEBUG step above before re-fixing this for real.
+        continue-on-error: true
         uses: actions/checkout@v4
         with:
           repository: gamename/pcb-fab-gate
