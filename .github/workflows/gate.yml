@@ -86,28 +86,20 @@ jobs:
       - name: Checkout caller repo (board files)
         uses: actions/checkout@v4
 
-      - name: DEBUG dump github/job context (temporary, SVW-0036 diagnosis)
-        run: |
-          echo "--- github context ---"
-          cat <<'EOF_GH'
-          ${{ toJSON(github) }}
-          EOF_GH
-          echo "--- job context ---"
-          cat <<'EOF_JOB'
-          ${{ toJSON(job) }}
-          EOF_JOB
-
       - name: Checkout pcb-fab-gate tooling (pinned to this gate.yml's own commit)
-        # `github.workflow_sha` is the TOP-LEVEL calling workflow's own commit
-        # (confirmed empirically against bb-pcb, SVW-0036: it resolved to
-        # bb-pcb's PR merge commit, which doesn't exist in this repo and
-        # 404s the fetch). Diagnosing the correct self-referential field via
-        # the DEBUG step above before re-fixing this for real.
-        continue-on-error: true
+        # `github.workflow_sha`/`github.workflow_ref` are the TOP-LEVEL
+        # calling workflow's own commit (confirmed empirically against
+        # bb-pcb, SVW-0036: it resolved to bb-pcb's PR merge commit, which
+        # doesn't exist in this repo and 404s the fetch). The fields actually
+        # scoped to "the workflow file that defines the current job" live
+        # under the `job` context, not `github`: `job.workflow_repository`
+        # and `job.workflow_sha` resolve to gamename/pcb-fab-gate at exactly
+        # the commit `@v1` (or whatever ref the caller pinned) points to,
+        # confirmed empirically via a context dump on the same PR.
         uses: actions/checkout@v4
         with:
-          repository: gamename/pcb-fab-gate
-          ref: ${{ github.workflow_sha }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           path: .pcb-fab-gate
 
       - name: Seed global KiCad footprint library table
