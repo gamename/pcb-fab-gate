@@ -102,15 +102,19 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .pcb-fab-gate
 
-      - name: Seed global KiCad footprint library table
+      - name: Seed global KiCad library tables
         # `--user root` gives HOME=/github/home (empty), so kicad-cli can't
-        # see the image's pre-populated global fp-lib-table at
-        # /home/kicad/.config/kicad/10.0/ — without it, every symbol using a
-        # standard library (Resistor_THT, MountingHole, etc.) reports a
-        # false-positive "library not included" ERC/DRC violation.
+        # see the image's pre-populated global fp-lib-table/sym-lib-table at
+        # /home/kicad/.config/kicad/10.0/ — without both, any symbol/footprint
+        # using a standard library (Device:R, Connector:TestPoint,
+        # Resistor_THT, MountingHole, etc.) reports a false-positive "library
+        # not included" ERC/DRC violation. Confirmed empirically on mansio-pcb
+        # spin1 (SVW-0036): missing sym-lib-table alone produced 35 ERC
+        # violations (lib_symbol_issues); seeding it dropped that to 0.
         run: |
           mkdir -p "$HOME/.config/kicad/10.0"
           cp /home/kicad/.config/kicad/10.0/fp-lib-table "$HOME/.config/kicad/10.0/fp-lib-table"
+          cp /home/kicad/.config/kicad/10.0/sym-lib-table "$HOME/.config/kicad/10.0/sym-lib-table"
 
       - name: Install pcb-gate
         # kicad/kicad:10.0 (Debian 13 trixie) ships python3 but no pip at
