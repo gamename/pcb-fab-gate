@@ -2,7 +2,7 @@ from pathlib import Path
 
 from pcb_gate import canary, keepout, kicad_tools, sexp
 from pcb_gate.report import Report
-from tests.conftest import segment, zone_pour
+from tests.conftest import segment, via, zone_pour
 
 ANT_KEEPOUT_SQUARE = [(0, 0), (10, 0), (10, 10), (0, 10)]
 
@@ -57,6 +57,45 @@ def test_inject_delete_connection_removes_a_segment():
     root = ["kicad_pcb", segment((0, 0), (5, 0), 0.2, "/A", "seg-1")]
     assert canary.inject_delete_connection(root) is True
     assert list(sexp.children(root, "segment")) == []
+
+
+def test_inject_delete_connection_requires_a_segment():
+    root = ["kicad_pcb"]
+    assert canary.inject_delete_connection(root) is False
+
+
+def test_inject_delete_connection_skips_a_net_with_a_zone_pour():
+    # /GND has a filled zone pour - deleting its one segment wouldn't
+    # actually break connectivity, so the canary must skip it and pick /A
+    # instead (SVW-0036: confirmed as a false-negative on a real board).
+    gnd_pour = zone_pour("/GND", "F.Cu", [(0, 0), (20, 0), (20, 20), (0, 20)], "pour-uuid")
+    root = [
+        "kicad_pcb",
+        gnd_pour,
+        segment((0, 0), (5, 0), 0.2, "/GND", "seg-gnd"),
+        segment((10, 10), (15, 10), 0.2, "/A", "seg-a"),
+    ]
+    assert canary.inject_delete_connection(root) is True
+    remaining_nets = {sexp.text_of(sexp.child(seg, "net")) for seg in sexp.children(root, "segment")}
+    assert remaining_nets == {"/GND"}
+
+
+def test_inject_delete_connection_removes_vias_on_the_same_net():
+    root = [
+        "kicad_pcb",
+        segment((0, 0), (5, 0), 0.2, "/A", "seg-a"),
+        via((5, 0), 0.6, 0.3, "/A", "via-a"),
+        via((20, 20), 0.6, 0.3, "/B", "via-b"),
+    ]
+    assert canary.inject_delete_connection(root) is True
+    remaining_vias = {sexp.text_of(sexp.child(v, "net")) for v in sexp.children(root, "via")}
+    assert remaining_vias == {"/B"}
+
+
+def test_inject_delete_connection_returns_false_when_every_net_has_a_pour():
+    gnd_pour = zone_pour("/GND", "F.Cu", [(0, 0), (20, 0), (20, 20), (0, 20)], "pour-uuid")
+    root = ["kicad_pcb", gnd_pour, segment((0, 0), (5, 0), 0.2, "/GND", "seg-gnd")]
+    assert canary.inject_delete_connection(root) is False
 
 
 def test_inject_via_in_keepout_requires_zone_and_net():
