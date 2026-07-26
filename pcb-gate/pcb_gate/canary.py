@@ -92,12 +92,43 @@ def inject_narrow_track(root: sexp.Node) -> bool:
     return True
 
 
+def _net_has_zone_pour(root: sexp.Node, net_name: str) -> bool:
+    for zone in sexp.children(root, "zone"):
+        if sexp.child(zone, "keepout") is not None:
+            continue  # a rule area carries no copper of its own
+        if sexp.text_of(sexp.child(zone, "net")) == net_name:
+            return True
+    return False
+
+
 def inject_delete_connection(root: sexp.Node) -> bool:
-    """Canary 3: delete a track segment, breaking a net's connectivity."""
-    segments = list(sexp.children(root, "segment"))
-    if not segments:
+    """Canary 3: fully disconnect one net's routing, breaking its connectivity.
+
+    Removing a single arbitrary segment doesn't guarantee `unconnected_items`
+    fires: if that segment's net also carries a filled zone pour (e.g. GND)
+    or a redundant parallel track, the net stays physically connected and the
+    canary comes back clean even though nothing about the checker was
+    exercised - a false-negative canary, confirmed on a real board with GND
+    pours (SVW-0036 bb-pcb spin2). Instead, pick a net that is routed with
+    track segments and carries no zone pour of its own, and remove every
+    segment and via on that net - the resulting two-terminal break has no
+    alternate copper path.
+    """
+    segments_by_net: dict[str, list[sexp.Node]] = {}
+    for seg in sexp.children(root, "segment"):
+        name = sexp.text_of(sexp.child(seg, "net"))
+        if name:
+            segments_by_net.setdefault(name, []).append(seg)
+
+    target_net = next((name for name in segments_by_net if not _net_has_zone_pour(root, name)), None)
+    if target_net is None:
         return False
-    root.remove(segments[0])
+
+    for seg in segments_by_net[target_net]:
+        root.remove(seg)
+    for via in list(sexp.children(root, "via")):
+        if sexp.text_of(sexp.child(via, "net")) == target_net:
+            root.remove(via)
     return True
 
 
