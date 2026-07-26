@@ -113,13 +113,19 @@ jobs:
           cp /home/kicad/.config/kicad/10.0/fp-lib-table "$HOME/.config/kicad/10.0/fp-lib-table"
 
       - name: Install pcb-gate
-        # kicad/kicad:10.0 is Debian-based (PEP 668 externally-managed) —
-        # --break-system-packages is required in this container.
+        # kicad/kicad:10.0 (Debian 13 trixie) ships python3 but no pip at
+        # all - not even the ensurepip module ("No module named pip", "No
+        # module named ensurepip", confirmed empirically, SVW-0036).
+        # python3-pip must be apt-installed first. --break-system-packages
+        # is then required (PEP 668 externally-managed environment).
         run: |
-          pip install --break-system-packages ./.pcb-fab-gate/pcb-gate
+          apt-get update -qq
+          apt-get install -y -qq python3-pip
+          python3 -m pip install --break-system-packages --root-user-action=ignore ./.pcb-fab-gate/pcb-gate
 
       - name: Discover project files
         id: discover
+        if: always()
         run: |
           set -euo pipefail
           project_dir="${{ inputs.project_dir }}"
