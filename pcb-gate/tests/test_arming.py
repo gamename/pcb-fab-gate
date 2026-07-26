@@ -1,0 +1,83 @@
+import datetime
+
+from pcb_gate import arming
+
+TODAY = datetime.date(2026, 7, 26)
+
+
+def test_clean_project_is_armed(project_factory):
+    files = project_factory()
+    report = arming.run(files, today=TODAY)
+    assert report.ok, report.violations
+
+
+def test_zeroed_netclass_clearance_fails(project_factory):
+    files = project_factory(netclasses=[{"name": "Default", "clearance": 0, "track_width": 0.2}])
+    report = arming.run(files, today=TODAY)
+    assert not report.ok
+    assert any(v.code == "zeroed_netclass_clearance" for v in report.violations)
+
+
+def test_zeroed_board_rule_floor_fails(project_factory):
+    files = project_factory(rules={"min_clearance": 0.0, "min_track_width": 0.2, "min_connection": 0.2})
+    report = arming.run(files, today=TODAY)
+    assert not report.ok
+    assert any(v.code == "zeroed_board_rule_floor" for v in report.violations)
+
+
+def test_downgraded_severity_fails(project_factory):
+    files = project_factory(
+        severities={
+            "clearance": "warning",
+            "shorting_items": "error",
+            "courtyards_overlap": "error",
+            "unconnected_items": "error",
+        }
+    )
+    report = arming.run(files, today=TODAY)
+    assert not report.ok
+    assert any(v.code == "downgraded_severity" for v in report.violations)
+
+
+def test_missing_capability_file_fails(project_factory):
+    files = project_factory(with_capability=False)
+    report = arming.run(files, today=TODAY)
+    assert not report.ok
+    assert any(v.code == "missing_capability_file" for v in report.violations)
+
+
+def test_stale_capability_file_fails(project_factory):
+    files = project_factory(capability_overrides={"retrieved": "2025-01-01"})
+    report = arming.run(files, today=TODAY)
+    assert not report.ok
+    assert any(v.code == "stale_capability_sheet" for v in report.violations)
+
+
+def test_netclass_below_fab_constraint_fails(project_factory):
+    files = project_factory(
+        netclasses=[{"name": "Default", "clearance": 0.05, "track_width": 0.2}],
+        capability_overrides={"min_clearance_mm": 0.1},
+    )
+    report = arming.run(files, today=TODAY)
+    assert not report.ok
+    assert any(v.code == "netclass_below_fab_clearance" for v in report.violations)
+
+
+def test_undeclared_exclusion_fails(project_factory):
+    files = project_factory(exclusions=["unconnected_items|1|2|uuid-a|uuid-b"])
+    report = arming.run(files, today=TODAY)
+    assert not report.ok
+    assert any(v.code == "undeclared_drc_exclusion" for v in report.violations)
+
+
+def test_declared_exclusion_does_not_fail(project_factory):
+    files = project_factory(
+        exclusions=["unconnected_items|1|2|uuid-a|uuid-b"],
+        capability_overrides={
+            "declared_exclusions": [
+                {"rule": "unconnected_items", "reason": "carrier-board DevKit GPIOs intentionally unconnected"}
+            ]
+        },
+    )
+    report = arming.run(files, today=TODAY)
+    assert report.ok, report.violations

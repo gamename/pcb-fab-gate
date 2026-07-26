@@ -1,0 +1,432 @@
+name: PCB Fab Gate
+
+# Reusable workflow (originally GNI-0271/0275/0276, ported and generalized by
+# SVW-0036 so every board org can call the same gate, not just
+# gamename-infrastructure). ERC + DRC run with --severity-all so warnings
+# (e.g. dangling/unconnected copper) fail the gate, not just hard errors.
+# Gerbers/drill only get exported and uploaded when every check below
+# passes.
+#
+# SVW-0036 armed the gate (GNI-0283 §1 checker design, carried forward
+# unchanged): before ERC/DRC are trusted, `pcb-gate arm` asserts the
+# project's own design-rule configuration is non-default and
+# `pcb-gate canary` proves the checkers can actually fail by injecting known
+# defects into a throwaway copy of the board (SVW-0034 RULE 1.1 - "a check
+# that cannot fail has not passed; it has abstained"). `pcb-gate keepout`
+# closes the gap that `kicad-cli pcb drc` does not evaluate rule areas at
+# all, so a clean CLI DRC means nothing about the antenna keepout on its
+# own. `pcb-gate overlap` is an independent same-layer clearance check that
+# shares no code with KiCad's DRC engine, so a regression in this project's
+# own rule configuration can't silently re-hide a short (SVW-0034 GATE 5).
+#
+# Cross-repo checkout: this workflow's own repo (gamename/pcb-fab-gate)
+# carries the `pcb-gate` Python package the steps below install and run.
+# Reusable-workflow jobs run in the CALLER's context, so the first
+# `actions/checkout@v4` below (no `repository:` override) checks out the
+# calling board repo, not this one. `github.workflow_sha` is documented as
+# "the commit SHA for the workflow file [that defines the current job]" -
+# i.e. it resolves to gamename/pcb-fab-gate's own commit at whatever ref the
+# caller pinned (`@v1`), so the second checkout below fetches the exact same
+# `pcb-gate` package version as the gate.yml logic that is running, no
+# matter which org or repo called it.
+#
+# GNI-0275: on a push to the repo's default branch, once the gate passes, a
+# second job publishes the fab package as a GitHub Release (tag
+# fab-<id_prefix>-NNNN-<short-sha>, [<ID_PREFIX>-NNNN] parsed from the head
+# commit message) so the gated zip has a permanent, front-page-findable home
+# instead of living only as a 90-day workflow artifact. PR runs never
+# publish. Callers must grant `contents: write` (not just `read`) for the
+# release job's token - reusable-workflow permissions are capped by the
+# caller's grant, so a caller stuck on `contents: read` will pass the gate
+# but 403 on release.
+#
+# GNI-0276: the release job also attaches a DigiKey List Import-ready CSV
+# (<Board>-DigikeyBom-fab-<id_prefix>-NNNN-<sha>.csv), built from the
+# schematic's Manufacturer/MPN symbol fields (kicad-cli sch export bom,
+# grouped by MPN) plus docs/BomKitItems.csv if present (fuse cartridges,
+# off-board antenna feed - parts that aren't schematic symbols). Boards
+# whose schematics don't populate Manufacturer/MPN yet are skipped
+# gracefully (a log line, not a failure) so this stays usable by callers
+# that haven't done that field work.
+
+on:
+  workflow_call:
+    inputs:
+      project_dir:
+        description: "Directory containing the .kicad_pro file"
+        required: true
+        type: string
+      id_prefix:
+        description: "Governance ID prefix for this caller, e.g. GNI, SVW, HEL, BB, C2DS. Used to parse [<id_prefix>-NNNN] from commit messages and to build the fab-<lowercased prefix>-NNNN-<sha> release tag."
+        required: true
+        type: string
+
+jobs:
+  fab-gate:
+    runs-on: ubuntu-latest
+    # Pinned to the KiCad major version that authored the boards
+    # (generator_version in each .kicad_pcb). kicad-cli from a different
+    # major can false-pass or fail to parse newer file formats.
+    # NOTE: this version string is echoed as a literal in the release job's
+    # notes step below — update both together if the pin changes.
+    container:
+      image: kicad/kicad:10.0
+      options: --user root
+    # The container's default shell is dash (sh), not bash — GHA falls back
+    # to sh -e for `run:` steps unless told otherwise, and mapfile/process
+    # substitution/pipefail below are bash-only.
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      base_name: ${{ steps.discover.outputs.base_name }}
+      fab_dir: ${{ steps.export.outputs.fab_dir }}
+
+    steps:
+      - name: Checkout caller repo (board files)
+        uses: actions/checkout@v4
+
+      - name: Checkout pcb-fab-gate tooling (pinned to this gate.yml's own commit)
+        uses: actions/checkout@v4
+        with:
+          repository: gamename/pcb-fab-gate
+          ref: ${{ github.workflow_sha }}
+          path: .pcb-fab-gate
+
+      - name: Seed global KiCad footprint library table
+        # `--user root` gives HOME=/github/home (empty), so kicad-cli can't
+        # see the image's pre-populated global fp-lib-table at
+        # /home/kicad/.config/kicad/10.0/ — without it, every symbol using a
+        # standard library (Resistor_THT, MountingHole, etc.) reports a
+        # false-positive "library not included" ERC/DRC violation.
+        run: |
+          mkdir -p "$HOME/.config/kicad/10.0"
+          cp /home/kicad/.config/kicad/10.0/fp-lib-table "$HOME/.config/kicad/10.0/fp-lib-table"
+
+      - name: Install pcb-gate
+        # kicad/kicad:10.0 is Debian-based (PEP 668 externally-managed) —
+        # --break-system-packages is required in this container.
+        run: |
+          pip install --break-system-packages ./.pcb-fab-gate/pcb-gate
+
+      - name: Discover project files
+        id: discover
+        run: |
+          set -euo pipefail
+          project_dir="${{ inputs.project_dir }}"
+          if [ ! -d "$project_dir" ]; then
+            echo "project_dir '$project_dir' does not exist" >&2
+            exit 1
+          fi
+          mapfile -t pro_files < <(find "$project_dir" -maxdepth 1 -name '*.kicad_pro')
+          if [ "${#pro_files[@]}" -ne 1 ]; then
+            echo "Expected exactly one .kicad_pro in '$project_dir', found ${#pro_files[@]}" >&2
+            exit 1
+          fi
+          base_name=$(basename "${pro_files[0]}" .kicad_pro)
+          sch_file="$project_dir/$base_name.kicad_sch"
+          pcb_file="$project_dir/$base_name.kicad_pcb"
+          for f in "$sch_file" "$pcb_file"; do
+            if [ ! -f "$f" ]; then
+              echo "Missing expected project file: $f" >&2
+              exit 1
+            fi
+          done
+          echo "base_name=$base_name" >> "$GITHUB_OUTPUT"
+          echo "sch_file=$sch_file" >> "$GITHUB_OUTPUT"
+          echo "pcb_file=$pcb_file" >> "$GITHUB_OUTPUT"
+
+      - name: Arm (RULE 1.2 / GATE 2 - design rules are armed and non-default)
+        if: always()
+        run: |
+          pcb-gate arm --project-dir "${{ inputs.project_dir }}" --report arm.json
+
+      - name: Canary (GATE 1 - every checker proves it can fail)
+        if: always()
+        run: |
+          pcb-gate canary --project-dir "${{ inputs.project_dir }}" --report canary.json
+
+      - name: ERC (schematic)
+        if: always()
+        run: |
+          kicad-cli sch erc --severity-all --exit-code-violations \
+            --format json -o erc.json "${{ steps.discover.outputs.sch_file }}"
+
+      - name: DRC (board)
+        if: always()
+        run: |
+          kicad-cli pcb drc --severity-all --exit-code-violations \
+            --format json -o drc.json "${{ steps.discover.outputs.pcb_file }}"
+
+      - name: Keepout (GATE 6 - antenna rule area, DRC does not enforce it)
+        if: always()
+        run: |
+          pcb-gate keepout --project-dir "${{ inputs.project_dir }}" --report keepout.json
+
+      - name: Overlap (GATE 5 - independent same-layer clearance check)
+        if: always()
+        run: |
+          pcb-gate overlap --project-dir "${{ inputs.project_dir }}" --report overlap.json
+
+      - name: Upload check reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kicad-reports-${{ steps.discover.outputs.base_name }}
+          path: |
+            arm.json
+            canary.json
+            erc.json
+            drc.json
+            keepout.json
+            overlap.json
+          if-no-files-found: warn
+
+      - name: Export gerbers + drill
+        id: export
+        if: success()
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:7}"
+          echo "FAB_DIR=fab-${short_sha}" >> "$GITHUB_ENV"
+          echo "fab_dir=fab-${short_sha}" >> "$GITHUB_OUTPUT"
+          mkdir -p "fab-${short_sha}"
+          kicad-cli pcb export gerbers -o "fab-${short_sha}" "${{ steps.discover.outputs.pcb_file }}"
+          kicad-cli pcb export drill -o "fab-${short_sha}" "${{ steps.discover.outputs.pcb_file }}"
+
+      - name: Upload fab artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.FAB_DIR }}
+          path: ${{ env.FAB_DIR }}/
+
+      - name: Export raw BOM (for DigiKey CSV)
+        # Grouped by MPN so each purchasable part is one row with a summed
+        # quantity and a ref range (e.g. "F1-F3"). Boards without Manufacturer
+        # /MPN fields on their symbols still succeed here — every row just
+        # comes back with an empty MPN column, which the release job uses as
+        # its skip signal (see build_digikey_bom.py).
+        id: bom
+        if: success()
+        run: |
+          set -euo pipefail
+          kicad-cli sch export bom \
+            --fields "Reference,QUANTITY,Manufacturer,MPN,Value,Description" \
+            --labels "Refs,Qty,Manufacturer,MPN,Value,Description" \
+            --group-by "MPN" \
+            -o bom_raw.csv \
+            "${{ steps.discover.outputs.sch_file }}"
+
+      - name: Upload raw BOM artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bom-raw-${{ steps.discover.outputs.base_name }}
+          path: bom_raw.csv
+          if-no-files-found: warn
+
+  release:
+    name: Publish fab release
+    needs: fab-gate
+    # Release only on a push to the default branch, in the same run that
+    # produced the gated artifact — never on PRs, never on other branches.
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive release tag from head commit
+        id: rel
+        run: |
+          set -euo pipefail
+          id_prefix="${{ inputs.id_prefix }}"
+          # A default "Create a merge commit" PR merge puts [<ID_PREFIX>-NNNN]
+          # on the PR-title line (line 2 of the body), not the subject (line 1)
+          # — e.g. "Merge pull request #3 from .../svw-0036-..." has no tag on
+          # its own subject. Search the full body so merge, squash, and
+          # direct-push commits are all handled the same way.
+          message=$(git log -1 --format=%B "${{ github.sha }}")
+          tagged_line=$(printf '%s\n' "$message" | grep -m1 -E "\\[${id_prefix}-[0-9]+\\]" || true)
+          if [ -z "$tagged_line" ]; then
+            echo "No [${id_prefix}-NNNN] tag found anywhere in the head commit message —" >&2
+            echo "untagged commit on the default branch is a process bug, failing loudly:" >&2
+            printf '%s\n' "$message" >&2
+            exit 1
+          fi
+          num=$(printf '%s' "$tagged_line" | grep -oE "\\[${id_prefix}-[0-9]+\\]" | head -1 | grep -oE '[0-9]+')
+          prefix_lower=$(printf '%s' "$id_prefix" | tr '[:upper:]' '[:lower:]')
+          short_sha="${GITHUB_SHA:0:7}"
+          {
+            echo "short_sha=$short_sha"
+            echo "tag=fab-${prefix_lower}-${num}-${short_sha}"
+            echo "subject=$(printf '%s' "$tagged_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing release (idempotency)
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${{ steps.rel.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.rel.outputs.tag }} already exists for this commit — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download fab artifact
+        if: steps.existing.outputs.skip == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.fab-gate.outputs.fab_dir }}
+          path: fab-package
+
+      - name: Download check reports
+        if: steps.existing.outputs.skip == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: kicad-reports-${{ needs.fab-gate.outputs.base_name }}
+          path: reports
+
+      - name: Download raw BOM
+        if: steps.existing.outputs.skip == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: bom-raw-${{ needs.fab-gate.outputs.base_name }}
+          path: bom-raw
+
+      - name: Build DigiKey BOM CSV
+        # Skips gracefully (has_bom=false, no failure) when every row's MPN
+        # column came back empty -- the signal that this board's schematic
+        # hasn't been given Manufacturer/MPN symbol fields yet (GNI-0276
+        # scope note: not every *-pcb repo has done that work).
+        if: steps.existing.outputs.skip == 'false'
+        id: digikey
+        run: |
+          set -euo pipefail
+          cat > build_digikey_bom.py <<'PYEOF'
+          import csv
+          import os
+          import sys
+
+          RAW = "bom-raw/bom_raw.csv"
+          KIT = "docs/BomKitItems.csv"
+          OUT = "digikey_bom.csv"
+
+          with open(RAW, newline="") as f:
+              rows = list(csv.DictReader(f))
+
+          qualifying = [r for r in rows if r.get("MPN", "").strip()]
+
+          if not qualifying:
+              print("No Manufacturer/MPN fields found on this schematic -- skipping DigiKey BOM CSV")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
+                  gh.write("has_bom=false\n")
+              sys.exit(0)
+
+          with open(OUT, "w", newline="") as f:
+              writer = csv.writer(f)
+              writer.writerow(["Quantity", "Manufacturer Part Number", "Manufacturer", "Customer Reference", "Description"])
+              for r in qualifying:
+                  desc = r.get("Description", "").strip() or r.get("Value", "").strip()
+                  writer.writerow([r["Qty"], r["MPN"], r["Manufacturer"], r["Refs"], desc])
+
+          kit_rows = 0
+          if os.path.exists(KIT):
+              with open(KIT, newline="") as kf, open(OUT, "a", newline="") as f:
+                  writer = csv.writer(f)
+                  kit_reader = csv.reader(kf)
+                  next(kit_reader, None)
+                  for kit_row in kit_reader:
+                      writer.writerow(kit_row)
+                      kit_rows += 1
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
+              gh.write("has_bom=true\n")
+          print(f"Wrote {OUT}: {len(qualifying)} board rows + {kit_rows} kit-item rows")
+          PYEOF
+          python3 build_digikey_bom.py
+
+      - name: Assemble release assets
+        if: steps.existing.outputs.skip == 'false'
+        id: assets
+        run: |
+          set -euo pipefail
+          zip_name="${{ needs.fab-gate.outputs.base_name }}-${{ steps.rel.outputs.tag }}.zip"
+          (cd fab-package && zip -rq "../$zip_name" .)
+          echo "zip_name=$zip_name" >> "$GITHUB_OUTPUT"
+
+          # BOM is optional — only some boards have one checked in yet.
+          mkdir -p bom
+          mapfile -t bom_files < <(find . -not -path './.git/*' -iname 'BOM*.md')
+          if [ "${#bom_files[@]}" -gt 0 ]; then
+            cp "${bom_files[@]}" bom/
+          fi
+          echo "bom_count=${#bom_files[@]}" >> "$GITHUB_OUTPUT"
+
+          # DigiKey CSV is also optional (GNI-0276) — only when the schematic
+          # has Manufacturer/MPN fields (steps.digikey.outputs.has_bom).
+          if [ "${{ steps.digikey.outputs.has_bom }}" = "true" ]; then
+            digikey_name="${{ needs.fab-gate.outputs.base_name }}-DigikeyBom-${{ steps.rel.outputs.tag }}.csv"
+            mv digikey_bom.csv "$digikey_name"
+            echo "digikey_name=$digikey_name" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compose release notes
+        if: steps.existing.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          check_line() {
+            # $1 = display name, $2 = report file
+            local path="reports/$2"
+            if [ ! -f "$path" ]; then
+              echo "- **$1:** report not found"
+              return
+            fi
+            local checked violations ok
+            checked=$(jq '(.checked // []) | length' "$path" 2>/dev/null || echo "?")
+            violations=$(jq '(.violations // []) | length' "$path" 2>/dev/null || echo "?")
+            ok=$(jq -r '.ok' "$path" 2>/dev/null || echo "unknown")
+            echo "- **$1:** $checked check(s), $violations violation(s) (ok=$ok)"
+          }
+          {
+            echo "**Board:** ${{ needs.fab-gate.outputs.base_name }}"
+            echo "**Commit:** \`${{ github.sha }}\` — ${{ steps.rel.outputs.subject }}"
+            echo "**KiCad:** kicad/kicad:10.0 container image"
+            echo
+            echo "**Gate results (SVW-0034):**"
+            check_line "Arm (RULE 1.2 / GATE 2)" "arm.json"
+            check_line "Canary (GATE 1)" "canary.json"
+            echo "- **ERC/DRC:** 0 violations required (kicad-cli --severity-all --exit-code-violations)"
+            check_line "Keepout (GATE 6)" "keepout.json"
+            check_line "Overlap (GATE 5)" "overlap.json"
+            echo
+            echo "This zip is the exact fab package that passed the gate — not a hand export."
+          } > notes.md
+
+      - name: Create release
+        if: steps.existing.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets=("${{ steps.assets.outputs.zip_name }}" reports/*.json)
+          bom_count="${{ steps.assets.outputs.bom_count }}"
+          if [ "$bom_count" -gt 0 ]; then
+            assets+=(bom/*)
+          fi
+          if [ "${{ steps.digikey.outputs.has_bom }}" = "true" ]; then
+            assets+=("${{ steps.assets.outputs.digikey_name }}")
+          fi
+          gh release create "${{ steps.rel.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.rel.outputs.tag }}" \
+            --notes-file notes.md \
+            "${assets[@]}"
