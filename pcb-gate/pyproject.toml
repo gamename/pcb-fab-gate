@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcb-gate"
+version = "0.1.0"
+description = "SVW-0036 / GNI-0283: arming assertions, canary injection, antenna-keepout geometry, and an independent overlap check for the SVW PCB fab gate (SVW-0034)."
+requires-python = ">=3.11"
+dependencies = [
+    "PyYAML>=6.0",
+    "shapely>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+pcb-gate = "pcb_gate.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pcb_gate*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

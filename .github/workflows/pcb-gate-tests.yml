@@ -1,0 +1,35 @@
+name: pcb-gate tests
+
+# CI signal for the pcb_gate Python package itself (unit tests, synthetic
+# fixtures, no KiCad container needed). The reusable gate.yml workflow (which
+# installs and runs pcb-gate against a caller's real board) is a separate,
+# consumer-side concern with its own kicad/kicad:10.0 container — see
+# gate.yml for that.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pcb-gate/**"
+      - ".github/workflows/pcb-gate-tests.yml"
+  pull_request:
+    paths:
+      - "pcb-gate/**"
+      - ".github/workflows/pcb-gate-tests.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pcb-gate (with test extras)
+        run: pip install -e "./pcb-gate[test]"
+
+      - name: Run pytest
+        run: pytest -q
+        working-directory: pcb-gate
