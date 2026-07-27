@@ -7,6 +7,17 @@ name: PCB Fab Gate
 # Gerbers/drill only get exported and uploaded when every check below
 # passes.
 #
+# SVW-0037 closed three gaps found running pcb-prefab-review against bb-pcb
+# spin2: the DRC step was missing --all-track-errors/--schematic-parity/
+# --refill-zones (Defect 1, worth 49+ violations and a whole missing check
+# class on that board alone); `pcb-gate keepout` hard-matched the zone name
+# "ANT_KEEPOUT" so bb-pcb's "U1_Antenna_Keepout" area skipped silently and a
+# skip printed identically to a pass (Defect 2 - see `keepout_zone_name` /
+# `rf_board` inputs below and Report.skip(..., blocking=...)); and
+# `items_not_allowed` was missing from the arming roster (Defect 3). Expect
+# violation counts to go UP on every board that has already adopted this
+# gate - that is the correct result, not a regression.
+#
 # SVW-0036 armed the gate (GNI-0283 §1 checker design, carried forward
 # unchanged): before ERC/DRC are trusted, `pcb-gate arm` asserts the
 # project's own design-rule configuration is non-default and
@@ -60,6 +71,16 @@ on:
         description: "Governance ID prefix for this caller, e.g. GNI, SVW, HEL, BB, C2DS. Used to parse [<id_prefix>-NNNN] from commit messages and to build the fab-<lowercased prefix>-NNNN-<sha> release tag."
         required: true
         type: string
+      keepout_zone_name:
+        description: "Comma-separated rule-area name(s) checked as the antenna keepout (SVW-0037 Defect 2 - the hard-coded 'ANT_KEEPOUT' match silently skipped boards, like bb-pcb, whose zone is named something else)."
+        required: false
+        type: string
+        default: "ANT_KEEPOUT"
+      rf_board:
+        description: "When true, a board with no matching keepout rule area FAILS the gate instead of skipping the check. Leave false for a non-RF board where 'no keepout zone' is a correct, expected state."
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   fab-gate:
@@ -163,7 +184,9 @@ jobs:
       - name: Canary (GATE 1 - every checker proves it can fail)
         if: always()
         run: |
-          pcb-gate canary --project-dir "${{ inputs.project_dir }}" --report canary.json
+          pcb-gate canary --project-dir "${{ inputs.project_dir }}" \
+            --keepout-zone-name "${{ inputs.keepout_zone_name }}" \
+            --report canary.json
 
       - name: ERC (schematic)
         if: always()
@@ -172,15 +195,29 @@ jobs:
             --format json -o erc.json "${{ steps.discover.outputs.sch_file }}"
 
       - name: DRC (board)
+        # Defect 1: --all-track-errors, --schematic-parity and --refill-zones
+        # were all missing. Measured effect on bb-pcb spin2 (SVW-0037):
+        # --all-track-errors alone is worth 49 additional violations (KiCad
+        # otherwise reports only the first error per track), and without
+        # --schematic-parity this step performs no board-vs-schematic check
+        # at all. See canary.inject_parity_break for the canary that proves
+        # --schematic-parity can actually fail before it's trusted.
         if: always()
         run: |
-          kicad-cli pcb drc --severity-all --exit-code-violations \
+          kicad-cli pcb drc --all-track-errors --schematic-parity --refill-zones \
+            --severity-all --exit-code-violations \
             --format json -o drc.json "${{ steps.discover.outputs.pcb_file }}"
 
       - name: Keepout (GATE 6 - antenna rule area, DRC does not enforce it)
         if: always()
         run: |
-          pcb-gate keepout --project-dir "${{ inputs.project_dir }}" --report keepout.json
+          args=(--project-dir "${{ inputs.project_dir }}"
+                --keepout-zone-name "${{ inputs.keepout_zone_name }}"
+                --report keepout.json)
+          if [ "${{ inputs.rf_board }}" = "true" ]; then
+            args+=(--rf-board)
+          fi
+          pcb-gate keepout "${args[@]}"
 
       - name: Overlap (GATE 5 - independent same-layer clearance check)
         if: always()
@@ -404,16 +441,22 @@ jobs:
           set -euo pipefail
           check_line() {
             # $1 = display name, $2 = report file
+            # Defect 2/3 (Task 3): a skip must be visible here, not just
+            # folded into ok=true - a report with skips isn't necessarily
+            # broken (a non-RF board correctly skipping keepout is fine),
+            # but it must never be invisible to a reader of this release.
             local path="reports/$2"
             if [ ! -f "$path" ]; then
               echo "- **$1:** report not found"
               return
             fi
-            local checked violations ok
+            local checked violations skipped skipped_blocking ok
             checked=$(jq '(.checked // []) | length' "$path" 2>/dev/null || echo "?")
             violations=$(jq '(.violations // []) | length' "$path" 2>/dev/null || echo "?")
+            skipped=$(jq '(.skipped // []) | length' "$path" 2>/dev/null || echo "?")
+            skipped_blocking=$(jq '(.skipped_blocking // []) | length' "$path" 2>/dev/null || echo "?")
             ok=$(jq -r '.ok' "$path" 2>/dev/null || echo "unknown")
-            echo "- **$1:** $checked check(s), $violations violation(s) (ok=$ok)"
+            echo "- **$1:** $checked check(s), $violations violation(s), $skipped skip(s) ($skipped_blocking blocking) (ok=$ok)"
           }
           {
             echo "**Board:** ${{ needs.fab-gate.outputs.base_name }}"

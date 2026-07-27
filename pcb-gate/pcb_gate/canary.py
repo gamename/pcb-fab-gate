@@ -156,6 +156,40 @@ def inject_via_in_keepout(root: sexp.Node, zone: sexp.Node) -> bool:
     return True
 
 
+def inject_parity_break(root: sexp.Node) -> bool:
+    """Canary 6: delete a footprint from the board copy so it no longer matches the schematic.
+
+    Defect 1: `--schematic-parity` was added to gate.yml's real DRC step
+    without a canary to prove any board's checker can actually fire it -
+    RULE 1.1 verbatim, "a check that cannot fail has not passed, it has
+    abstained." A footprint present in the schematic but missing from the
+    board is the simplest, most reliable parity break to inject: KiCad
+    reports it as `missing_footprint` (confirmed against a real board's
+    `rule_severities`, bb-pcb spin2) regardless of net wiring, so it doesn't
+    share the false-negative failure mode `inject_delete_connection` had to
+    work around (a net with a zone pour masking a deleted connection).
+    """
+    footprints = list(sexp.children(root, "footprint"))
+    if not footprints:
+        return False
+    root.remove(footprints[0])
+    return True
+
+
+def default_parity_drc_runner(pcb_file: Path, report_path: Path) -> kicad_tools.DrcResult:
+    """The parity canary's own DRC invocation - always forces `--schematic-parity` on.
+
+    Kept separate from the `drc_runner` parameter (used by the short /
+    track-width / unconnected canaries above) rather than adding a flag to
+    that shared 2-arg callable: `drc_runner` is stubbed directly in tests
+    (see test_canary.py's `clean_drc_runner`), and widening its signature
+    would break every existing stub for a flag only this one canary needs.
+    Same pattern as `keepout_checker` below - a distinct callable per
+    distinct external-tool invocation shape.
+    """
+    return kicad_tools.run_drc(pcb_file, report_path, schematic_parity=True)
+
+
 def inject_dru_assertion(dru_file: Path) -> None:
     """Canary 5: append a deliberately-false (constraint assertion) rule to .kicad_dru."""
     canary_rule = [
@@ -221,19 +255,23 @@ def _run_dru_canary(report: Report, files: ProjectFiles, drc_runner: DrcRunner) 
             )
 
 
-def _run_keepout_canary(report: Report, files: ProjectFiles, keepout_checker: KeepoutChecker) -> None:
-    key, description = "keepout", "place a via inside the ANT_KEEPOUT rule area"
+def _run_keepout_canary(
+    report: Report, files: ProjectFiles, keepout_checker: KeepoutChecker, keepout_zone_names: list[str]
+) -> None:
+    key, description = "keepout", f"place a via inside a rule area named {', '.join(keepout_zone_names)}"
     with tempfile.TemporaryDirectory(prefix="pcb-gate-canary-keepout-") as tmp:
         copy_files = _copy_project(files, Path(tmp) / "project")
         root = sexp.parse_file(copy_files.pcb_file)
-        zones = keepout.find_ant_keepout_zones(root)
+        zones = keepout.find_ant_keepout_zones(root, keepout_zone_names)
         if not zones:
-            report.skip(f"canary '{key}': no ANT_KEEPOUT rule area on this board")
+            report.skip(f"canary '{key}': no rule area named any of {keepout_zone_names} on this board")
             return
 
         injected = inject_via_in_keepout(root, zones[0])
         if not injected:
-            report.skip(f"canary '{key}': could not place a via inside ANT_KEEPOUT (degenerate polygon or no nets)")
+            report.skip(
+                f"canary '{key}': could not place a via inside the keepout area (degenerate polygon or no nets)"
+            )
             return
         sexp.dump_file(copy_files.pcb_file, root)
 
@@ -248,12 +286,56 @@ def _run_keepout_canary(report: Report, files: ProjectFiles, keepout_checker: Ke
             report.check(f"canary '{key}' fired as expected (keepout checker reported a violation)")
 
 
+def _run_parity_canary(report: Report, files: ProjectFiles, parity_runner: DrcRunner) -> None:
+    """Defect 1: prove `--schematic-parity` can actually fail before it's trusted.
+
+    "No footprint to remove" is a legitimate, non-blocking skip - same as
+    every other canary's "no eligible target on this board." A schematic
+    that can't be loaded is different: the canary itself couldn't run, which
+    per the brief must "skip loudly and fail the gate," not skip quietly
+    (Report.skip(..., blocking=True) - Defect 2/3's skip-vs-pass fix).
+    """
+    key, description = "parity", "delete a footprint from the board copy so it no longer matches the schematic"
+    with tempfile.TemporaryDirectory(prefix="pcb-gate-canary-parity-") as tmp:
+        copy_files = _copy_project(files, Path(tmp) / "project")
+        if not copy_files.sch_file.is_file() or not copy_files.sch_file.read_text(encoding="utf-8").strip():
+            report.skip(
+                f"canary '{key}': schematic file {copy_files.sch_file.name} could not be loaded - "
+                "the parity canary cannot run",
+                blocking=True,
+            )
+            return
+
+        root = sexp.parse_file(copy_files.pcb_file)
+        injected = inject_parity_break(root)
+        if not injected:
+            report.skip(f"canary '{key}' ({description}): no footprint on this board to remove")
+            return
+        sexp.dump_file(copy_files.pcb_file, root)
+
+        report.check(f"canary '{key}': {description}")
+        result = parity_runner(copy_files.pcb_file, copy_files.project_dir / f"canary_{key}.json")
+        expected = {"missing_footprint", "extra_footprint", "net_conflict"}
+        if result.has_violation_type(*expected):
+            report.check(f"canary '{key}' fired as expected (one of {sorted(expected)})")
+        else:
+            report.fail(
+                "canary_did_not_fire",
+                f"canary '{key}' ({description}) came back clean - expected one of "
+                f"{sorted(expected)} in the DRC report. The gate is broken.",
+            )
+
+
 def run(
     files: ProjectFiles,
     drc_runner: DrcRunner = kicad_tools.run_drc,
-    keepout_checker: KeepoutChecker = keepout.run,
+    keepout_checker: KeepoutChecker | None = None,
+    parity_runner: DrcRunner = default_parity_drc_runner,
+    keepout_zone_names: list[str] | None = None,
 ) -> Report:
     report = Report(tool="pcb-gate canary", project=files.base_name)
+    zone_names = list(keepout_zone_names) if keepout_zone_names else [keepout.KEEPOUT_ZONE_NAME]
+    checker = keepout_checker or (lambda f: keepout.run(f, keepout_zone_names=zone_names))
 
     _run_drc_canary(
         report, files, "short", "duplicate a track onto a different net, offset to overlap",
@@ -267,7 +349,8 @@ def run(
         report, files, "unconnected", "delete a track segment",
         inject_delete_connection, {"unconnected_items"}, drc_runner,
     )
-    _run_keepout_canary(report, files, keepout_checker)
+    _run_keepout_canary(report, files, checker, zone_names)
     _run_dru_canary(report, files, drc_runner)
+    _run_parity_canary(report, files, parity_runner)
 
     return report

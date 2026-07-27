@@ -2,7 +2,7 @@ from pathlib import Path
 
 from pcb_gate import canary, keepout, kicad_tools, sexp
 from pcb_gate.report import Report
-from tests.conftest import segment, via, zone_pour
+from tests.conftest import footprint, pad, segment, via, zone_pour
 
 ANT_KEEPOUT_SQUARE = [(0, 0), (10, 0), (10, 10), (0, 10)]
 
@@ -130,6 +130,113 @@ def test_inject_dru_assertion_appends_to_existing_file(tmp_path):
     assert "canary" in rule_names
 
 
+# --- SVW-0037 Defect 1: schematic-parity canary ----------------------------
+
+
+def test_inject_parity_break_requires_a_footprint():
+    root = ["kicad_pcb"]
+    assert canary.inject_parity_break(root) is False
+
+
+def test_inject_parity_break_removes_a_footprint():
+    fp = footprint("U1", (5, 5), [pad(1, "smd", "rect", (0, 0), (1, 1), "/GND", "pad-1")])
+    root = ["kicad_pcb", fp]
+    assert canary.inject_parity_break(root) is True
+    assert list(sexp.children(root, "footprint")) == []
+
+
+def _firing_parity_drc_result() -> kicad_tools.DrcResult:
+    # Real shape confirmed against kicad-cli 10.0 (SVW-0037, mansio-pcb spin1):
+    # schematic_parity entries are flat violation dicts, not sheet-wrappers.
+    return kicad_tools.DrcResult(
+        exit_code=5,
+        stdout="",
+        stderr="",
+        report={
+            "violations": [],
+            "unconnected_items": [],
+            "schematic_parity": [
+                {"type": "extra_footprint", "severity": "warning", "description": "Extra footprint", "items": []}
+            ],
+        },
+    )
+
+
+def test_parity_canary_fires_when_footprint_missing_from_pcb(project_factory):
+    fp = footprint("U1", (5, 5), [pad(1, "smd", "rect", (0, 0), (1, 1), "/GND", "pad-1")])
+    files = project_factory(items=[fp])
+
+    def firing_parity_runner(pcb_file: Path, report_path: Path):
+        return _firing_parity_drc_result()
+
+    report = canary.run(
+        files,
+        drc_runner=lambda pcb, rpt: _firing_drc_result(),
+        keepout_checker=lambda f: Report(tool="stub-keepout", project=f.base_name),
+        parity_runner=firing_parity_runner,
+    )
+    assert report.ok, report.violations
+
+
+def test_parity_canary_fails_the_gate_when_it_comes_back_clean(project_factory):
+    fp = footprint("U1", (5, 5), [pad(1, "smd", "rect", (0, 0), (1, 1), "/GND", "pad-1")])
+    files = project_factory(items=[fp])
+
+    def clean_parity_runner(pcb_file: Path, report_path: Path):
+        return _clean_drc_result()
+
+    report = canary.run(
+        files,
+        drc_runner=lambda pcb, rpt: _firing_drc_result(),
+        keepout_checker=lambda f: Report(tool="stub-keepout", project=f.base_name),
+        parity_runner=clean_parity_runner,
+    )
+    assert not report.ok
+    assert any(
+        v.code == "canary_did_not_fire" and "parity" in v.message for v in report.violations
+    )
+
+
+def test_parity_canary_skips_benignly_when_no_footprint_on_board(project_factory):
+    files = project_factory(items=[segment((0, 0), (5, 0), 0.2, "/A", "seg-1")])
+
+    def unreachable_parity_runner(pcb_file: Path, report_path: Path):
+        raise AssertionError("parity_runner should not be called when there's no footprint to remove")
+
+    report = canary.run(
+        files,
+        drc_runner=lambda pcb, rpt: _firing_drc_result(),
+        keepout_checker=lambda f: Report(tool="stub-keepout", project=f.base_name),
+        parity_runner=unreachable_parity_runner,
+    )
+    assert report.ok, report.violations
+    assert not report.skipped_blocking
+
+
+def test_parity_canary_blocking_skip_when_schematic_missing(project_factory):
+    fp = footprint("U1", (5, 5), [pad(1, "smd", "rect", (0, 0), (1, 1), "/GND", "pad-1")])
+    files = project_factory(items=[fp])
+    # `discover()` requires the .kicad_sch to exist, so an empty file is how
+    # "present but unloadable" is representable here - a totally missing
+    # schematic never reaches the parity canary at all (every canary's
+    # _copy_project -> discover() fails first, project-wide, not a parity-
+    # specific case this canary needs to handle).
+    files.sch_file.write_text("", encoding="utf-8")
+
+    def unreachable_parity_runner(pcb_file: Path, report_path: Path):
+        raise AssertionError("parity_runner should not be called when the schematic can't be loaded")
+
+    report = canary.run(
+        files,
+        drc_runner=lambda pcb, rpt: _firing_drc_result(),
+        keepout_checker=lambda f: Report(tool="stub-keepout", project=f.base_name),
+        parity_runner=unreachable_parity_runner,
+    )
+    assert not report.ok
+    assert report.skipped_blocking
+    assert any("schematic" in s.lower() for s in report.skipped_blocking)
+
+
 def test_harness_fails_when_every_checker_is_stubbed_clean(project_factory):
     files = project_factory(
         items=[segment((0, 0), (5, 0), 0.2, "/A", "seg-1"), segment((10, 10), (15, 10), 0.2, "/B", "seg-2")]
@@ -141,11 +248,21 @@ def test_harness_fails_when_every_checker_is_stubbed_clean(project_factory):
     def clean_keepout_checker(files):
         return Report(tool="stub-keepout", project=files.base_name)
 
-    report = canary.run(files, drc_runner=clean_drc_runner, keepout_checker=clean_keepout_checker)
+    def unreachable_parity_runner(pcb_file: Path, report_path: Path):
+        raise AssertionError("no footprint on this fixture - parity canary must skip, not call the runner")
+
+    report = canary.run(
+        files,
+        drc_runner=clean_drc_runner,
+        keepout_checker=clean_keepout_checker,
+        parity_runner=unreachable_parity_runner,
+    )
 
     assert not report.ok
     fire_failures = [v for v in report.violations if v.code == "canary_did_not_fire"]
-    # short, track_width, unconnected, assertion - keepout canary is skipped (no ANT_KEEPOUT zone)
+    # short, track_width, unconnected, assertion - keepout canary is skipped (no ANT_KEEPOUT
+    # zone) and parity canary is skipped (no footprint on this fixture to remove), neither
+    # of which is a canary_did_not_fire failure - a legitimate "no eligible target" skip.
     assert len(fire_failures) == 4
 
 

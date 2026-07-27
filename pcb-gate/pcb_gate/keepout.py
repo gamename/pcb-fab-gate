@@ -3,10 +3,14 @@
 `kicad-cli pcb drc` does not evaluate rule areas / keepouts at all (confirmed:
 no CLI flag exposes it, and RULE 6.6/GATE 6 of SVW-0034 call this out by
 name) - a clean CLI DRC means nothing about the antenna. This module is the
-geometric check that closes that gap: it finds the `ANT_KEEPOUT` rule area,
-and tests every copper item on every copper layer for intersection with it,
-including filled zone polygons (the actual "pour leaked into the antenna
-clearance" failure mode, and the whole reason this check exists).
+geometric check that closes that gap: it finds the caller-configured rule
+area(s) (default `ANT_KEEPOUT`; SVW-0037 made the name(s) configurable after
+bb-pcb's zone turned out to be named `U1_Antenna_Keepout` and was silently
+skipping - "no matching zone" and "correctly not applicable" must never be
+the same code path, see `rf_board` below) and tests every copper item on
+every copper layer for intersection with it, including filled zone polygons
+(the actual "pour leaked into the antenna clearance" failure mode, and the
+whole reason this check exists).
 
 Fill-freshness: `kicad-cli pcb drc --refill-zones --save-board` (KiCad 10.0.4,
 confirmed empirically) refills a board's zones and writes the result back to
@@ -41,13 +45,33 @@ KEEPOUT_ZONE_NAME = "ANT_KEEPOUT"
 ALLOWED_NETCLASS = "RF_ANT"
 
 
-def find_ant_keepout_zones(root: sexp.Node) -> list[sexp.Node]:
+def find_ant_keepout_zones(root: sexp.Node, zone_names: list[str] | None = None) -> list[sexp.Node]:
+    """Find rule areas whose name is in `zone_names` (default: the legacy single name).
+
+    Defect 2: the original hard-coded `== KEEPOUT_ZONE_NAME` match meant any
+    board whose rule area wasn't spelled exactly "ANT_KEEPOUT" (e.g. bb-pcb's
+    "U1_Antenna_Keepout") skipped silently. A board may also carry more than
+    one keepout area (bb-pcb is adding a second, BB-0021), so this accepts a
+    list, not a single literal.
+
+    Uses `sexp.find_all` (recursive), not `sexp.children` (direct children
+    only): confirmed against two real boards during the SVW-0037 audit
+    (mansio-pcb spin1, helios-pcb walter-char-board) that a keepout zone can
+    be embedded *inside a footprint* definition, not just at board top
+    level - a library part (the Walter modem footprint, here) can ship its
+    own antenna-keepout rule area so it moves and rotates with the
+    footprint's placement. `sexp.children` alone missed those entirely, a
+    second and structurally deeper reason those two boards were silently
+    skipping this check, on top of the name mismatch Defect 2 itself
+    describes.
+    """
+    names = set(zone_names) if zone_names else {KEEPOUT_ZONE_NAME}
     zones = []
-    for zone in sexp.children(root, "zone"):
+    for zone in sexp.find_all(root, "zone"):
         if sexp.child(zone, "keepout") is None:
             continue
         name_node = sexp.child(zone, "name")
-        if sexp.text_of(name_node) == KEEPOUT_ZONE_NAME:
+        if sexp.text_of(name_node) in names:
             zones.append(zone)
     return zones
 
@@ -100,7 +124,7 @@ def _refilled_copy_or_none(files: ProjectFiles, report: Report):
         return sexp.parse_file(copy_pcb)
 
 
-def _check_segments(check_root, keepout_layers, keepout_area, is_allowed, report) -> int:
+def _check_segments(check_root, keepout_layers, keepout_area, is_allowed, report, zone_label) -> int:
     count = 0
     for seg in sexp.children(check_root, "segment"):
         layer = sexp.text_of(sexp.child(seg, "layer"))
@@ -120,12 +144,12 @@ def _check_segments(check_root, keepout_layers, keepout_area, is_allowed, report
         if geom.intersects(keepout_area) and not is_allowed(net_name):
             report.fail(
                 "keepout_track_intrusion",
-                f"track on {layer} (net {net_name!r}) intersects '{KEEPOUT_ZONE_NAME}'",
+                f"track on {layer} (net {net_name!r}) intersects '{zone_label}'",
             )
     return count
 
 
-def _check_vias(check_root, copper_layers, keepout_layers, keepout_area, is_allowed, report) -> int:
+def _check_vias(check_root, copper_layers, keepout_layers, keepout_area, is_allowed, report, zone_label) -> int:
     count = 0
     for via in sexp.children(check_root, "via"):
         layers_node = sexp.child(via, "layers")
@@ -144,12 +168,12 @@ def _check_vias(check_root, copper_layers, keepout_layers, keepout_area, is_allo
             report.fail(
                 "keepout_via_intrusion",
                 f"via at ({cx}, {cy}) on layers {sorted(via_layers)} (net {net_name!r}) "
-                f"intersects '{KEEPOUT_ZONE_NAME}'",
+                f"intersects '{zone_label}'",
             )
     return count
 
 
-def _check_pads(check_root, copper_layers, keepout_layers, keepout_area, is_allowed, report) -> int:
+def _check_pads(check_root, copper_layers, keepout_layers, keepout_area, is_allowed, report, zone_label) -> int:
     count = 0
     for footprint in sexp.children(check_root, "footprint"):
         for pad in sexp.children(footprint, "pad"):
@@ -167,12 +191,14 @@ def _check_pads(check_root, copper_layers, keepout_layers, keepout_area, is_allo
                 report.fail(
                     "keepout_pad_intrusion",
                     f"pad {pad_num!r} of {ref} on layers {sorted(layers_here)} "
-                    f"(net {net_name!r}) intersects '{KEEPOUT_ZONE_NAME}'",
+                    f"(net {net_name!r}) intersects '{zone_label}'",
                 )
     return count
 
 
-def _check_filled_polygons(check_root, keepout_zones, keepout_layers, keepout_area, is_allowed, report) -> int:
+def _check_filled_polygons(
+    check_root, keepout_zones, keepout_layers, keepout_area, is_allowed, report, zone_label
+) -> int:
     count = 0
     for zone in sexp.children(check_root, "zone"):
         if zone in keepout_zones:
@@ -192,22 +218,38 @@ def _check_filled_polygons(check_root, keepout_zones, keepout_layers, keepout_ar
             if geom.intersects(keepout_area) and not is_allowed(zone_net):
                 report.fail(
                     "keepout_pour_intrusion",
-                    f"filled zone pour on {layer} (net {zone_net!r}) intersects '{KEEPOUT_ZONE_NAME}' - "
+                    f"filled zone pour on {layer} (net {zone_net!r}) intersects '{zone_label}' - "
                     "copper poured into the antenna clearance",
                 )
     return count
 
 
-def run(files: ProjectFiles) -> Report:
+def run(files: ProjectFiles, keepout_zone_names: list[str] | None = None, rf_board: bool = False) -> Report:
     report = Report(tool="pcb-gate keepout", project=files.base_name)
     root = sexp.parse_file(files.pcb_file)
 
-    zones = find_ant_keepout_zones(root)
+    zone_names = list(keepout_zone_names) if keepout_zone_names else [KEEPOUT_ZONE_NAME]
+    zone_label = ", ".join(zone_names)
+    # This determination is itself the check that matters when nothing below
+    # runs: it's what makes a legitimate "not an RF board" skip register as a
+    # PASS (checked is non-empty) instead of Report.summarize()'s
+    # INCONCLUSIVE (Defect 2/3 - a report with zero checks must never look
+    # like a pass).
+    report.check(f"rf_board={rf_board}, configured keepout rule area name(s): {zone_label}")
+
+    zones = find_ant_keepout_zones(root, zone_names)
     if not zones:
-        report.skip(f"no '{KEEPOUT_ZONE_NAME}' rule area on this board - nothing to check")
+        if rf_board:
+            report.fail(
+                "missing_keepout_on_rf_board",
+                f"rf_board=true but no rule area named any of [{zone_label}] was found on this board - "
+                "an RF board declares its antenna keepout, it doesn't skip the check",
+            )
+            return report
+        report.skip(f"no rule area named any of [{zone_label}] on this board - nothing to check")
         return report
 
-    report.check(f"found {len(zones)} '{KEEPOUT_ZONE_NAME}' rule area(s)")
+    report.check(f"found {len(zones)} rule area(s) matching [{zone_label}]")
     copper_layers = board_copper_layers(root)
 
     keepout_layers: set[str] = set()
@@ -218,10 +260,10 @@ def run(files: ProjectFiles) -> Report:
 
     if not keepout_polys:
         report.fail(
-            "degenerate_keepout_zone", f"'{KEEPOUT_ZONE_NAME}' rule area has no usable polygon outline"
+            "degenerate_keepout_zone", f"'{zone_label}' rule area has no usable polygon outline"
         )
         return report
-    report.check(f"'{KEEPOUT_ZONE_NAME}' applies to layers: {sorted(keepout_layers)}")
+    report.check(f"'{zone_label}' applies to layers: {sorted(keepout_layers)}")
     keepout_area = unary_union(keepout_polys)
 
     pro = load_kicad_pro(files.pro_file)
@@ -233,10 +275,12 @@ def run(files: ProjectFiles) -> Report:
             return False
         return netclass.netclass_of(net_name, pro) == ALLOWED_NETCLASS
 
-    n_segments = _check_segments(check_root, keepout_layers, keepout_area, is_allowed, report)
-    n_vias = _check_vias(check_root, copper_layers, keepout_layers, keepout_area, is_allowed, report)
-    n_pads = _check_pads(check_root, copper_layers, keepout_layers, keepout_area, is_allowed, report)
-    n_pours = _check_filled_polygons(check_root, zones, keepout_layers, keepout_area, is_allowed, report)
+    n_segments = _check_segments(check_root, keepout_layers, keepout_area, is_allowed, report, zone_label)
+    n_vias = _check_vias(check_root, copper_layers, keepout_layers, keepout_area, is_allowed, report, zone_label)
+    n_pads = _check_pads(check_root, copper_layers, keepout_layers, keepout_area, is_allowed, report, zone_label)
+    n_pours = _check_filled_polygons(
+        check_root, zones, keepout_layers, keepout_area, is_allowed, report, zone_label
+    )
 
     report.check(
         f"checked {n_segments} track segment(s), {n_vias} via(s), {n_pads} pad(s), "
