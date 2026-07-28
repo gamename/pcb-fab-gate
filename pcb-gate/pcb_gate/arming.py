@@ -20,11 +20,45 @@ from . import capability as capability_mod
 from .project import ProjectFiles, load_kicad_pro
 from .report import Report
 
+# SVW-0037 Defect 3 / Task 4: reconciled against SVW-0034's own text rather
+# than left as the four this roster inherited from GNI-0283. Additions below
+# are each backed by an explicit spec statement (rule_severities key names
+# confirmed against a real board, bb-pcb spin2, 2026-07-27):
+#
+#   - items_not_allowed: Defect 3 itself. KiCad's rule-area (keepout) DRC
+#     violation class - a board can downgrade or ignore it and pass arming
+#     while `pcb-gate keepout`'s own gap (Defect 2) goes unnoticed.
+#   - track_dangling, via_dangling: RULE 2.1 - "Dangling tracks and
+#     unconnected items on power nets are hard stops regardless of KiCad
+#     severity." unconnected_items was already required; the dangling-track
+#     half of that sentence was not.
+#   - missing_courtyard: GATE 4's "Five checks default to Ignore... Turn on
+#     at least the courtyard one."
+#
+# Deliberately NOT added, per the same reconciliation pass:
+#   - footprint_filters_mismatch, footprint_type_mismatch,
+#     track_not_centered_on_via, tuning_profile_track_geometries: GATE 4
+#     lists these alongside missing_courtyard as defaulting to Ignore, but
+#     only instructs turning courtyard on ("at least"). Awareness items, not
+#     a stated gate requirement - recorded here, not silently dropped.
+#   - missing_footprint, extra_footprint, net_conflict, duplicate_footprints,
+#     footprint_symbol_mismatch, footprint_symbol_field_mismatch,
+#     lib_footprint_issues, lib_footprint_mismatch: schematic-parity-adjacent
+#     classes. GATE 4 mandates *running* schematic parity (the
+#     `--schematic-parity` flag, Defect 1/Task 1) but does not say these
+#     specific severities must be pinned to `error`; `--severity-all` in
+#     gate.yml's DRC step still surfaces them at whatever severity is set, so
+#     canary.inject_parity_break (Task 1) can prove the check fires without
+#     this roster asserting their severity too.
 REQUIRED_ERROR_SEVERITIES = (
     "clearance",
     "shorting_items",
     "courtyards_overlap",
     "unconnected_items",
+    "items_not_allowed",
+    "track_dangling",
+    "via_dangling",
+    "missing_courtyard",
 )
 
 REQUIRED_BOARD_RULE_FLOORS = ("min_clearance", "min_track_width", "min_connection")

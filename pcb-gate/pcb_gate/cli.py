@@ -22,9 +22,21 @@ SUBCOMMANDS = {
     "overlap": overlap.run,
 }
 
+# Defect 2 (Task 2): both `keepout` and `canary` need to agree on which rule
+# area name(s) count as the antenna keepout - `canary` because its keepout
+# canary injects into whatever zone `keepout` would check, and a mismatch
+# there would make the canary itself silently inert on a non-default name.
+KEEPOUT_ZONE_NAME_SUBCOMMANDS = {"keepout", "canary"}
+RF_BOARD_SUBCOMMANDS = {"keepout"}
+
 
 def _default_report_path(project_dir: Path, subcommand: str) -> Path:
     return project_dir / f"pcb-gate-{subcommand}.json"
+
+
+def _parse_zone_names(raw: str) -> list[str]:
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    return names or [keepout.KEEPOUT_ZONE_NAME]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,6 +47,18 @@ def main(argv: list[str] | None = None) -> int:
         sub = subparsers.add_parser(name)
         sub.add_argument("--project-dir", required=True)
         sub.add_argument("--report", default=None, help="Where to write the JSON report")
+        if name in KEEPOUT_ZONE_NAME_SUBCOMMANDS:
+            sub.add_argument(
+                "--keepout-zone-name",
+                default=keepout.KEEPOUT_ZONE_NAME,
+                help="Comma-separated rule-area name(s) checked as the antenna keepout",
+            )
+        if name in RF_BOARD_SUBCOMMANDS:
+            sub.add_argument(
+                "--rf-board",
+                action="store_true",
+                help="Fail (instead of skip) when no matching keepout rule area is found",
+            )
 
     args = parser.parse_args(argv)
 
@@ -45,7 +69,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     check_fn = SUBCOMMANDS[args.subcommand]
-    report: Report = check_fn(files)
+    kwargs = {}
+    if args.subcommand in KEEPOUT_ZONE_NAME_SUBCOMMANDS:
+        kwargs["keepout_zone_names"] = _parse_zone_names(args.keepout_zone_name)
+    if args.subcommand in RF_BOARD_SUBCOMMANDS:
+        kwargs["rf_board"] = args.rf_board
+
+    report: Report = check_fn(files, **kwargs)
 
     report_path = Path(args.report) if args.report else _default_report_path(files.project_dir, args.subcommand)
     report.write(report_path)

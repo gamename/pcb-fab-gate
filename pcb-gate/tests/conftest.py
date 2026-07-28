@@ -44,6 +44,10 @@ def make_kicad_pro(
         "shorting_items": "error",
         "courtyards_overlap": "error",
         "unconnected_items": "error",
+        "items_not_allowed": "error",
+        "track_dangling": "error",
+        "via_dangling": "error",
+        "missing_courtyard": "error",
     }
     exclusions = exclusions if exclusions is not None else []
 

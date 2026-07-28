@@ -82,3 +82,78 @@ def test_track_outside_layer_scope_is_not_checked(project_factory):
     )
     report = keepout.run(files)
     assert report.ok, report.violations
+
+
+# --- SVW-0037 Defect 2: configurable zone name + rf_board -----------------
+
+
+def test_default_name_still_finds_ant_keepout(project_factory):
+    """Backward compatibility: no override behaves exactly as before."""
+    files = project_factory(
+        items=[ant_keepout_zone(), segment((2, 2), (8, 8), 0.2, "/GND", "seg-1")]
+    )
+    report = keepout.run(files)
+    assert not report.ok
+    assert any(v.code == "keepout_track_intrusion" for v in report.violations)
+
+
+def test_non_default_name_is_invisible_without_override(project_factory):
+    """The exact defect this fixed: a real zone under a different name looked like 'nothing here'."""
+    zone = zone_pour("", "F.Cu", ANT_KEEPOUT_SQUARE, "keepout-uuid", keepout=True, name="U1_Antenna_Keepout")
+    files = project_factory(items=[zone, segment((2, 2), (8, 8), 0.2, "/GND", "seg-1")])
+    report = keepout.run(files)
+    assert report.ok
+    assert report.skipped
+    assert not report.skipped_blocking
+
+
+def test_configured_name_finds_non_default_zone(project_factory):
+    zone = zone_pour("", "F.Cu", ANT_KEEPOUT_SQUARE, "keepout-uuid", keepout=True, name="U1_Antenna_Keepout")
+    files = project_factory(items=[zone, segment((2, 2), (8, 8), 0.2, "/GND", "seg-1")])
+    report = keepout.run(files, keepout_zone_names=["U1_Antenna_Keepout"])
+    assert not report.ok
+    assert any(v.code == "keepout_track_intrusion" for v in report.violations)
+
+
+def test_configured_name_accepts_a_list_of_multiple_names(project_factory):
+    zone = zone_pour("", "F.Cu", ANT_KEEPOUT_SQUARE, "keepout-uuid", keepout=True, name="Analog_BCu_Keepout")
+    files = project_factory(items=[zone, segment((2, 2), (8, 8), 0.2, "/GND", "seg-1")])
+    report = keepout.run(files, keepout_zone_names=["U1_Antenna_Keepout", "Analog_BCu_Keepout"])
+    assert not report.ok
+    assert any(v.code == "keepout_track_intrusion" for v in report.violations)
+
+
+def test_rf_board_with_no_matching_zone_fails_not_skips(project_factory):
+    files = project_factory(items=[segment((0, 0), (5, 5), 0.2, "/GND", "seg-1")])
+    report = keepout.run(files, rf_board=True)
+    assert not report.ok
+    assert any(v.code == "missing_keepout_on_rf_board" for v in report.violations)
+
+
+def test_non_rf_board_with_no_matching_zone_still_skips(project_factory):
+    files = project_factory(items=[segment((0, 0), (5, 5), 0.2, "/GND", "seg-1")])
+    report = keepout.run(files, rf_board=False)
+    assert report.ok
+    assert report.skipped
+    assert not report.skipped_blocking
+
+
+def test_keepout_zone_embedded_in_a_footprint_is_found(project_factory):
+    """Real-board finding (SVW-0037 audit, mansio-pcb spin1 / helios-pcb): a library
+    footprint (the Walter modem socket) ships its own keepout zone nested inside the
+    footprint definition, not as a board-top-level zone. A direct-children-only search
+    misses it entirely regardless of name configuration.
+    """
+    fp = footprint("U1", (5, 5), [ant_keepout_zone()])
+    files = project_factory(items=[fp, segment((2, 2), (8, 8), 0.2, "/GND", "seg-1")])
+    report = keepout.run(files)
+    assert not report.ok
+    assert any(v.code == "keepout_track_intrusion" for v in report.violations)
+
+
+def test_rf_board_result_is_never_zero_checks(project_factory):
+    """The RF-board determination itself is a check, so a skip here is never INCONCLUSIVE."""
+    files = project_factory(items=[segment((0, 0), (5, 5), 0.2, "/GND", "seg-1")])
+    report = keepout.run(files, rf_board=False)
+    assert report.checked
+    assert report.summarize() == 0

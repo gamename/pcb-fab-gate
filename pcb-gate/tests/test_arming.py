@@ -70,6 +70,65 @@ def test_undeclared_exclusion_fails(project_factory):
     assert any(v.code == "undeclared_drc_exclusion" for v in report.violations)
 
 
+def test_items_not_allowed_downgraded_fails(project_factory):
+    """SVW-0037 Defect 3: items_not_allowed (rule-area violations) must be armed too."""
+    files = project_factory(
+        severities={
+            "clearance": "error",
+            "shorting_items": "error",
+            "courtyards_overlap": "error",
+            "unconnected_items": "error",
+            "items_not_allowed": "warning",
+            "track_dangling": "error",
+            "via_dangling": "error",
+            "missing_courtyard": "error",
+        }
+    )
+    report = arming.run(files, today=TODAY)
+    assert not report.ok
+    assert any(v.code == "downgraded_severity" and "items_not_allowed" in v.message for v in report.violations)
+
+
+def test_dangling_track_or_via_downgraded_fails(project_factory):
+    """RULE 2.1: dangling tracks are a hard stop, same as unconnected_items."""
+    files = project_factory(
+        severities={
+            "clearance": "error",
+            "shorting_items": "error",
+            "courtyards_overlap": "error",
+            "unconnected_items": "error",
+            "items_not_allowed": "error",
+            "track_dangling": "warning",
+            "via_dangling": "warning",
+            "missing_courtyard": "error",
+        }
+    )
+    report = arming.run(files, today=TODAY)
+    assert not report.ok
+    codes_with_messages = [(v.code, v.message) for v in report.violations]
+    assert any(code == "downgraded_severity" and "track_dangling" in msg for code, msg in codes_with_messages)
+    assert any(code == "downgraded_severity" and "via_dangling" in msg for code, msg in codes_with_messages)
+
+
+def test_missing_courtyard_ignored_fails(project_factory):
+    """GATE 4: 'Turn on at least the courtyard one' of the five Ignore-by-default checks."""
+    files = project_factory(
+        severities={
+            "clearance": "error",
+            "shorting_items": "error",
+            "courtyards_overlap": "error",
+            "unconnected_items": "error",
+            "items_not_allowed": "error",
+            "track_dangling": "error",
+            "via_dangling": "error",
+            "missing_courtyard": "ignore",
+        }
+    )
+    report = arming.run(files, today=TODAY)
+    assert not report.ok
+    assert any(v.code == "downgraded_severity" and "missing_courtyard" in v.message for v in report.violations)
+
+
 def test_declared_exclusion_does_not_fail(project_factory):
     files = project_factory(
         exclusions=["unconnected_items|1|2|uuid-a|uuid-b"],
