@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pcb_gate import canary, keepout, kicad_tools, sexp
+from pcb_gate import arming, canary, keepout, kicad_tools, netlist, sexp
 from pcb_gate.report import Report
 from tests.conftest import footprint, pad, segment, via, zone_pour
 
@@ -174,6 +174,8 @@ def test_parity_canary_fires_when_footprint_missing_from_pcb(project_factory):
         drc_runner=lambda pcb, rpt: _firing_drc_result(),
         keepout_checker=lambda f: Report(tool="stub-keepout", project=f.base_name),
         parity_runner=firing_parity_runner,
+        netlist_runner=_stub_netlist_runner(fires=True),
+        arm_runner=_stub_arm_runner(fires=True),
     )
     assert report.ok, report.violations
 
@@ -208,6 +210,8 @@ def test_parity_canary_skips_benignly_when_no_footprint_on_board(project_factory
         drc_runner=lambda pcb, rpt: _firing_drc_result(),
         keepout_checker=lambda f: Report(tool="stub-keepout", project=f.base_name),
         parity_runner=unreachable_parity_runner,
+        netlist_runner=_stub_netlist_runner(fires=True),
+        arm_runner=_stub_arm_runner(fires=True),
     )
     assert report.ok, report.violations
     assert not report.skipped_blocking
@@ -237,6 +241,36 @@ def test_parity_canary_blocking_skip_when_schematic_missing(project_factory):
     assert any("schematic" in s.lower() for s in report.skipped_blocking)
 
 
+def _stub_netlist_runner(fires: bool):
+    def _runner(files: Path, write: bool):
+        lock_path = files.project_dir / netlist.LOCK_FILENAME
+        if write:
+            if not lock_path.is_file():
+                baseline = {
+                    "schema": 1,
+                    "nets": [{"name": "GND", "nodes": ["C1.1"]}, {"name": "+3V3", "nodes": []}],
+                    "components": [],
+                }
+                lock_path.write_text(netlist.to_lock_text(baseline), encoding="utf-8")
+            return Report(tool="stub-netlist-write", project=files.base_name)
+        report = Report(tool="stub-netlist-verify", project=files.base_name)
+        if fires:
+            report.fail("connectivity_regression", "stub fired")
+        return report
+
+    return _runner
+
+
+def _stub_arm_runner(fires: bool):
+    def _runner(files: Path):
+        report = Report(tool="stub-arm", project=files.base_name)
+        if fires:
+            report.fail("undeclared_ignored_severity", "stub fired")
+        return report
+
+    return _runner
+
+
 def test_harness_fails_when_every_checker_is_stubbed_clean(project_factory):
     files = project_factory(
         items=[segment((0, 0), (5, 0), 0.2, "/A", "seg-1"), segment((10, 10), (15, 10), 0.2, "/B", "seg-2")]
@@ -256,14 +290,130 @@ def test_harness_fails_when_every_checker_is_stubbed_clean(project_factory):
         drc_runner=clean_drc_runner,
         keepout_checker=clean_keepout_checker,
         parity_runner=unreachable_parity_runner,
+        netlist_runner=_stub_netlist_runner(fires=False),
+        arm_runner=_stub_arm_runner(fires=False),
     )
 
     assert not report.ok
     fire_failures = [v for v in report.violations if v.code == "canary_did_not_fire"]
-    # short, track_width, unconnected, assertion - keepout canary is skipped (no ANT_KEEPOUT
-    # zone) and parity canary is skipped (no footprint on this fixture to remove), neither
-    # of which is a canary_did_not_fire failure - a legitimate "no eligible target" skip.
-    assert len(fire_failures) == 4
+    # short, track_width, unconnected, assertion, netlist, arm - keepout canary is
+    # skipped (no ANT_KEEPOUT zone) and parity canary is skipped (no footprint on this
+    # fixture to remove), neither of which is a canary_did_not_fire failure - a
+    # legitimate "no eligible target" skip.
+    assert len(fire_failures) == 6
+
+
+# --- SVW-0038: netlist canary (RULE 16.4) --------------------------------
+
+
+def test_inject_lock_pin_move_requires_a_donor_net_with_nodes():
+    lock = {"nets": [{"name": "GND", "nodes": []}], "components": []}
+    assert canary.inject_lock_pin_move(lock) is False
+
+
+def test_inject_lock_pin_move_requires_a_second_net():
+    lock = {"nets": [{"name": "GND", "nodes": ["C1.1"]}], "components": []}
+    assert canary.inject_lock_pin_move(lock) is False
+
+
+def test_inject_lock_pin_move_moves_a_node_between_nets():
+    lock = {"nets": [{"name": "SDA", "nodes": ["U3.7"]}, {"name": "SCL", "nodes": []}], "components": []}
+    assert canary.inject_lock_pin_move(lock) is True
+    by_name = {n["name"]: n["nodes"] for n in lock["nets"]}
+    assert by_name["SDA"] == []
+    assert by_name["SCL"] == ["U3.7"]
+
+
+def test_netlist_canary_fires_when_check_detects_the_move(project_factory):
+    files = project_factory()
+    report = canary.run(
+        files,
+        drc_runner=lambda pcb, rpt: _firing_drc_result(),
+        keepout_checker=lambda f: Report(tool="stub-keepout", project=f.base_name),
+        parity_runner=lambda pcb, rpt: _firing_drc_result(),
+        netlist_runner=_stub_netlist_runner(fires=True),
+        arm_runner=_stub_arm_runner(fires=True),
+    )
+    assert report.ok, report.violations
+
+
+def test_netlist_canary_fails_the_gate_when_it_comes_back_clean(project_factory):
+    files = project_factory()
+    report = canary.run(
+        files,
+        drc_runner=lambda pcb, rpt: _firing_drc_result(),
+        keepout_checker=lambda f: Report(tool="stub-keepout", project=f.base_name),
+        parity_runner=lambda pcb, rpt: _firing_drc_result(),
+        netlist_runner=_stub_netlist_runner(fires=False),
+        arm_runner=_stub_arm_runner(fires=True),
+    )
+    assert not report.ok
+    assert any(v.code == "canary_did_not_fire" and "netlist" in v.message for v in report.violations)
+
+
+def test_netlist_canary_blocking_skip_when_baseline_cannot_be_written(project_factory):
+    files = project_factory()
+
+    def unavailable_netlist_runner(f, write):
+        return Report(tool="stub-netlist", project=f.base_name)  # ok=True but never writes the lock
+
+    report = canary.run(
+        files,
+        drc_runner=lambda pcb, rpt: _firing_drc_result(),
+        keepout_checker=lambda f: Report(tool="stub-keepout", project=f.base_name),
+        parity_runner=lambda pcb, rpt: _firing_drc_result(),
+        netlist_runner=unavailable_netlist_runner,
+        arm_runner=_stub_arm_runner(fires=True),
+    )
+    assert not report.ok
+    assert report.skipped_blocking
+
+
+# --- SVW-0038: arm canary (undeclared 'ignore' severity) ------------------
+
+
+def test_inject_undeclared_ignore_severity_picks_a_non_ignore_check():
+    pro = {"board": {"design_settings": {"rule_severities": {"clearance": "error", "track_width": "warning"}}}}
+    changed = canary.inject_undeclared_ignore_severity(pro)
+    assert changed in ("clearance", "track_width")
+    assert pro["board"]["design_settings"]["rule_severities"][changed] == "ignore"
+
+
+def test_inject_undeclared_ignore_severity_returns_none_when_all_already_ignored():
+    pro = {"board": {"design_settings": {"rule_severities": {"clearance": "ignore"}}}}
+    assert canary.inject_undeclared_ignore_severity(pro) is None
+
+
+def test_arm_canary_fires_with_the_real_arming_checker(project_factory):
+    """Integration test with the real `arming.run` (no kicad-cli needed for arm)."""
+    files = project_factory()
+    report = canary.run(
+        files,
+        drc_runner=lambda pcb, rpt: _firing_drc_result(),
+        keepout_checker=lambda f: Report(tool="stub-keepout", project=f.base_name),
+        parity_runner=lambda pcb, rpt: _firing_drc_result(),
+        netlist_runner=_stub_netlist_runner(fires=True),
+        arm_runner=arming.run,
+    )
+    assert report.ok, report.violations
+
+
+def test_arm_canary_fails_the_gate_when_it_comes_back_clean(project_factory):
+    files = project_factory()
+
+    def clean_arm_runner(f):
+        return Report(tool="stub-arm-clean", project=f.base_name)
+
+    report = canary.run(
+        files,
+        drc_runner=lambda pcb, rpt: _firing_drc_result(),
+        keepout_checker=lambda f: Report(tool="stub-keepout", project=f.base_name),
+        parity_runner=lambda pcb, rpt: _firing_drc_result(),
+        netlist_runner=_stub_netlist_runner(fires=True),
+        arm_runner=clean_arm_runner,
+    )
+    assert not report.ok
+    assert any(v.code == "canary_did_not_fire" and "severity" in v.message for v in report.violations)
 
 
 def test_harness_passes_when_checkers_fire_as_expected(project_factory):
@@ -274,6 +424,12 @@ def test_harness_passes_when_checkers_fire_as_expected(project_factory):
     def working_drc_runner(pcb_file: Path, report_path: Path):
         return _firing_drc_result()
 
-    report = canary.run(files, drc_runner=working_drc_runner, keepout_checker=keepout.run)
+    report = canary.run(
+        files,
+        drc_runner=working_drc_runner,
+        keepout_checker=keepout.run,
+        netlist_runner=_stub_netlist_runner(fires=True),
+        arm_runner=_stub_arm_runner(fires=True),
+    )
 
     assert report.ok, report.violations

@@ -3,7 +3,7 @@
 Every subcommand discovers the project, runs its check, prints what it
 checked, writes a JSON report, and exits non-zero on any violation - the
 same contract `kicad-cli pcb drc` already follows, so the workflow can treat
-all six checks (arm, canary, ERC, DRC, keepout, overlap) uniformly.
+all seven checks (arm, canary, ERC, DRC, netlist, keepout, overlap) uniformly.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import arming, canary, keepout, overlap
+from . import arming, canary, keepout, netlist, overlap
 from .project import ProjectError, discover
 from .report import Report
 
@@ -20,6 +20,7 @@ SUBCOMMANDS = {
     "canary": canary.run,
     "keepout": keepout.run,
     "overlap": overlap.run,
+    "netlist": netlist.run,
 }
 
 # Defect 2 (Task 2): both `keepout` and `canary` need to agree on which rule
@@ -28,6 +29,10 @@ SUBCOMMANDS = {
 # there would make the canary itself silently inert on a non-default name.
 KEEPOUT_ZONE_NAME_SUBCOMMANDS = {"keepout", "canary"}
 RF_BOARD_SUBCOMMANDS = {"keepout"}
+# SVW-0038: `netlist --write` regenerates/refreshes the lock; without it,
+# `netlist` verifies the committed lock against a fresh regeneration and
+# fails on any difference (RULE 16.1 - the lock is generated, never hand-edited).
+WRITE_SUBCOMMANDS = {"netlist"}
 
 
 def _default_report_path(project_dir: Path, subcommand: str) -> Path:
@@ -59,6 +64,12 @@ def main(argv: list[str] | None = None) -> int:
                 action="store_true",
                 help="Fail (instead of skip) when no matching keepout rule area is found",
             )
+        if name in WRITE_SUBCOMMANDS:
+            sub.add_argument(
+                "--write",
+                action="store_true",
+                help="Generate/refresh connectivity.lock.json instead of verifying it",
+            )
 
     args = parser.parse_args(argv)
 
@@ -74,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
         kwargs["keepout_zone_names"] = _parse_zone_names(args.keepout_zone_name)
     if args.subcommand in RF_BOARD_SUBCOMMANDS:
         kwargs["rf_board"] = args.rf_board
+    if args.subcommand in WRITE_SUBCOMMANDS:
+        kwargs["write"] = args.write
 
     report: Report = check_fn(files, **kwargs)
 

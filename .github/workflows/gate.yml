@@ -18,6 +18,21 @@ name: PCB Fab Gate
 # violation counts to go UP on every board that has already adopted this
 # gate - that is the correct result, not a regression.
 #
+# SVW-0038 (GATE 15 / RULE 16.x) closed the hole that every connectivity
+# check above it is point-in-time: none of them compare this commit's
+# connectivity to the last reviewed one, so a net swap (e.g. a pin moved from
+# UART_TX to UART_RX) passes every one of them. `pcb-gate netlist` verifies
+# the committed connectivity.lock.json against a fresh regeneration from the
+# schematic and fails on any difference the commit doesn't already contain.
+# Same amendment also replaced RULE 1.2's enumerated arming roster
+# (REQUIRED_ERROR_SEVERITIES) with a closed-world assertion - no DRC or ERC
+# severity anywhere in the project may be 'ignore' unless declared in
+# pcb-capability.yml's declared_severity_downgrades - because the enumerated
+# form was itself the shape that produced SVW-0037 Defect 3 (a check absent
+# from the list was never asserted). Expect boards to go red on this too:
+# KiCad 10 ships five DRC and four ERC checks defaulting to Ignore, and every
+# one now needs to be turned on or declared with a reason.
+#
 # SVW-0036 armed the gate (GNI-0283 §1 checker design, carried forward
 # unchanged): before ERC/DRC are trusted, `pcb-gate arm` asserts the
 # project's own design-rule configuration is non-default and
@@ -208,6 +223,17 @@ jobs:
             --severity-all --exit-code-violations \
             --format json -o drc.json "${{ steps.discover.outputs.pcb_file }}"
 
+      - name: Netlist (GATE 15 / RULE 16.x - connectivity regression)
+        # Compares the committed connectivity.lock.json against a fresh
+        # regeneration from the schematic and fails on any difference the
+        # commit doesn't already contain (SVW-0038). Runs after DRC (so a
+        # board that can't even load its schematic fails earlier and
+        # louder) and before the geometric checks, per the brief's stated
+        # run order.
+        if: always()
+        run: |
+          pcb-gate netlist --project-dir "${{ inputs.project_dir }}" --report netlist.json
+
       - name: Keepout (GATE 6 - antenna rule area, DRC does not enforce it)
         if: always()
         run: |
@@ -234,6 +260,7 @@ jobs:
             canary.json
             erc.json
             drc.json
+            netlist.json
             keepout.json
             overlap.json
           if-no-files-found: warn
@@ -249,6 +276,11 @@ jobs:
           mkdir -p "fab-${short_sha}"
           kicad-cli pcb export gerbers -o "fab-${short_sha}" "${{ steps.discover.outputs.pcb_file }}"
           kicad-cli pcb export drill -o "fab-${short_sha}" "${{ steps.discover.outputs.pcb_file }}"
+          # RULE 16.6: the lock is a fab artifact - it ships inside the fab
+          # package itself so the connectivity that was verified is
+          # recoverable from the release, not reconstructed from the repo
+          # at some later date.
+          cp "${{ inputs.project_dir }}/connectivity.lock.json" "fab-${short_sha}/"
 
       - name: Upload fab artifact
         if: success()
@@ -467,6 +499,7 @@ jobs:
             check_line "Arm (RULE 1.2 / GATE 2)" "arm.json"
             check_line "Canary (GATE 1)" "canary.json"
             echo "- **ERC/DRC:** 0 violations required (kicad-cli --severity-all --exit-code-violations)"
+            check_line "Netlist (GATE 15 / RULE 16.x)" "netlist.json"
             check_line "Keepout (GATE 6)" "keepout.json"
             check_line "Overlap (GATE 5)" "overlap.json"
             echo
