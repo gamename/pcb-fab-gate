@@ -36,6 +36,30 @@ def test_declared_exclusions_parsed(tmp_path):
     assert cap.declared_exclusion_rules() == {"unconnected_items"}
 
 
+def test_declared_severity_downgrades_parsed(tmp_path):
+    path = make_capability_yml(
+        tmp_path,
+        declared_severity_downgrades=[
+            {
+                "check": "footprint_type_mismatch",
+                "severity": "ignore",
+                "reason": "DevKit carrier footprints intentionally mismatched; see docs/board-notes.md",
+            }
+        ],
+    )
+    cap = capability.load(path)
+    by_check = cap.declared_severity_downgrades_by_check()
+    assert set(by_check) == {"footprint_type_mismatch"}
+    assert by_check["footprint_type_mismatch"].reason.startswith("DevKit carrier footprints")
+
+
+def test_declared_severity_downgrades_defaults_empty(tmp_path):
+    path = make_capability_yml(tmp_path)
+    cap = capability.load(path)
+    assert cap.declared_severity_downgrades == ()
+    assert cap.declared_severity_downgrades_by_check() == {}
+
+
 def test_age_days():
     cap = capability.Capability(
         fab="JLCPCB",

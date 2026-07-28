@@ -11,18 +11,22 @@ Never mutates the real project: every injection happens in a fresh
 """
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import uuid as uuid_mod
 from pathlib import Path
 from typing import Callable
 
-from . import keepout, kicad_tools, sexp
+from . import arming, keepout, kicad_tools, sexp
+from . import netlist as netlist_mod
 from .project import ProjectFiles, discover
 from .report import Report
 
 DrcRunner = Callable[[Path, Path], kicad_tools.DrcResult]
 KeepoutChecker = Callable[[ProjectFiles], Report]
+NetlistRunner = Callable[[ProjectFiles, bool], Report]
+ArmRunner = Callable[[ProjectFiles], Report]
 
 
 def _copy_project(files: ProjectFiles, dest: Path) -> ProjectFiles:
@@ -174,6 +178,97 @@ def inject_parity_break(root: sexp.Node) -> bool:
         return False
     root.remove(footprints[0])
     return True
+
+
+def inject_lock_pin_move(lock: dict) -> bool:
+    """Canary (RULE 16.4): move one node from one net to another, in a lock file.
+
+    Mutates the committed `connectivity.lock.json` copy rather than the schematic
+    itself. `pcb-gate netlist`'s verify path is a symmetric diff between "the committed
+    lock" and "a fresh regeneration from the schematic" - it cannot tell which side
+    changed, so tampering with the committed side exercises exactly the same
+    comparison code a real schematic edit would, without needing to hand-edit wire
+    topology/labels in a `.kicad_sch` (nets there are derived from wire connectivity,
+    not a per-pin attribute like `.kicad_pcb`'s `(net ...)`, so there is no equivalently
+    simple single-token edit on that side).
+    """
+    nets = lock.get("nets", [])
+    donor = next((n for n in nets if n.get("nodes")), None)
+    if donor is None:
+        return False
+    recipient = next((n for n in nets if n["name"] != donor["name"]), None)
+    if recipient is None:
+        return False
+    moved_node = donor["nodes"].pop(0)
+    recipient["nodes"].append(moved_node)
+    recipient["nodes"].sort(key=netlist_mod.natural_key)
+    return True
+
+
+def inject_undeclared_ignore_severity(pro: dict) -> str | None:
+    """The arm-change canary (SVW-0038): downgrade one DRC severity to 'ignore'
+    without declaring it in pcb-capability.yml, and return which key was changed."""
+    severities = ((pro.get("board") or {}).get("design_settings") or {}).get("rule_severities") or {}
+    for key, value in severities.items():
+        if value != "ignore":
+            severities[key] = "ignore"
+            return key
+    return None
+
+
+def _run_netlist_canary(report: Report, files: ProjectFiles, netlist_runner: NetlistRunner) -> None:
+    key, description = "netlist", "move one node from one net to another in the committed connectivity lock"
+    with tempfile.TemporaryDirectory(prefix="pcb-gate-canary-netlist-") as tmp:
+        copy_files = _copy_project(files, Path(tmp) / "project")
+        baseline = netlist_runner(copy_files, True)
+        lock_path = copy_files.project_dir / netlist_mod.LOCK_FILENAME
+        if not baseline.ok or not lock_path.is_file():
+            report.skip(
+                f"canary '{key}': could not generate a baseline {netlist_mod.LOCK_FILENAME} "
+                "(kicad-cli unavailable or export failed) - the netlist canary cannot run",
+                blocking=True,
+            )
+            return
+
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        injected = inject_lock_pin_move(lock)
+        if not injected:
+            report.skip(f"canary '{key}' ({description}): fewer than two nets with nodes on this board")
+            return
+        lock_path.write_text(netlist_mod.to_lock_text(lock), encoding="utf-8")
+
+        report.check(f"canary '{key}': {description}")
+        result = netlist_runner(copy_files, False)
+        if result.ok:
+            report.fail(
+                "canary_did_not_fire",
+                f"canary '{key}' ({description}) came back clean - the connectivity regression check is broken.",
+            )
+        else:
+            report.check(f"canary '{key}' fired as expected (netlist reported a connectivity regression)")
+
+
+def _run_arm_canary(report: Report, files: ProjectFiles, arm_runner: ArmRunner) -> None:
+    key, description = "undeclared_severity", "downgrade one DRC severity to 'ignore' without declaring it"
+    with tempfile.TemporaryDirectory(prefix="pcb-gate-canary-arm-") as tmp:
+        copy_files = _copy_project(files, Path(tmp) / "project")
+        pro = json.loads(copy_files.pro_file.read_text(encoding="utf-8"))
+        changed_key = inject_undeclared_ignore_severity(pro)
+        if changed_key is None:
+            report.skip(f"canary '{key}' ({description}): no DRC severity available to downgrade")
+            return
+        copy_files.pro_file.write_text(json.dumps(pro), encoding="utf-8")
+
+        report.check(f"canary '{key}': {description} (key={changed_key!r})")
+        arm_report = arm_runner(copy_files)
+        if arm_report.ok:
+            report.fail(
+                "canary_did_not_fire",
+                f"canary '{key}' ({description}, key={changed_key!r}) came back clean - "
+                "the closed-world severity check (RULE 1.2) is broken.",
+            )
+        else:
+            report.check(f"canary '{key}' fired as expected (arm reported an undeclared ignored severity)")
 
 
 def default_parity_drc_runner(pcb_file: Path, report_path: Path) -> kicad_tools.DrcResult:
@@ -332,6 +427,8 @@ def run(
     keepout_checker: KeepoutChecker | None = None,
     parity_runner: DrcRunner = default_parity_drc_runner,
     keepout_zone_names: list[str] | None = None,
+    netlist_runner: NetlistRunner = netlist_mod.run,
+    arm_runner: ArmRunner = arming.run,
 ) -> Report:
     report = Report(tool="pcb-gate canary", project=files.base_name)
     zone_names = list(keepout_zone_names) if keepout_zone_names else [keepout.KEEPOUT_ZONE_NAME]
@@ -352,5 +449,7 @@ def run(
     _run_keepout_canary(report, files, checker, zone_names)
     _run_dru_canary(report, files, drc_runner)
     _run_parity_canary(report, files, parity_runner)
+    _run_netlist_canary(report, files, netlist_runner)
+    _run_arm_canary(report, files, arm_runner)
 
     return report

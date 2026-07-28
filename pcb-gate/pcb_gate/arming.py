@@ -20,48 +20,32 @@ from . import capability as capability_mod
 from .project import ProjectFiles, load_kicad_pro
 from .report import Report
 
-# SVW-0037 Defect 3 / Task 4: reconciled against SVW-0034's own text rather
-# than left as the four this roster inherited from GNI-0283. Additions below
-# are each backed by an explicit spec statement (rule_severities key names
-# confirmed against a real board, bb-pcb spin2, 2026-07-27):
-#
-#   - items_not_allowed: Defect 3 itself. KiCad's rule-area (keepout) DRC
-#     violation class - a board can downgrade or ignore it and pass arming
-#     while `pcb-gate keepout`'s own gap (Defect 2) goes unnoticed.
-#   - track_dangling, via_dangling: RULE 2.1 - "Dangling tracks and
-#     unconnected items on power nets are hard stops regardless of KiCad
-#     severity." unconnected_items was already required; the dangling-track
-#     half of that sentence was not.
-#   - missing_courtyard: GATE 4's "Five checks default to Ignore... Turn on
-#     at least the courtyard one."
-#
-# Deliberately NOT added, per the same reconciliation pass:
-#   - footprint_filters_mismatch, footprint_type_mismatch,
-#     track_not_centered_on_via, tuning_profile_track_geometries: GATE 4
-#     lists these alongside missing_courtyard as defaulting to Ignore, but
-#     only instructs turning courtyard on ("at least"). Awareness items, not
-#     a stated gate requirement - recorded here, not silently dropped.
-#   - missing_footprint, extra_footprint, net_conflict, duplicate_footprints,
-#     footprint_symbol_mismatch, footprint_symbol_field_mismatch,
-#     lib_footprint_issues, lib_footprint_mismatch: schematic-parity-adjacent
-#     classes. GATE 4 mandates *running* schematic parity (the
-#     `--schematic-parity` flag, Defect 1/Task 1) but does not say these
-#     specific severities must be pinned to `error`; `--severity-all` in
-#     gate.yml's DRC step still surfaces them at whatever severity is set, so
-#     canary.inject_parity_break (Task 1) can prove the check fires without
-#     this roster asserting their severity too.
-REQUIRED_ERROR_SEVERITIES = (
-    "clearance",
-    "shorting_items",
-    "courtyards_overlap",
-    "unconnected_items",
-    "items_not_allowed",
-    "track_dangling",
-    "via_dangling",
-    "missing_courtyard",
-)
-
+# SVW-0038 RULE 1.2 (replaces the SVW-0037 enumerated roster in full): an
+# enumerated allowlist of severities that must equal "error" is precisely
+# the shape SVW-0037 Defect 3 exploited - `items_not_allowed` was simply
+# absent from the list, so it was never asserted, and a report that checked
+# nothing printed identically to one that passed. RULE 1.2's closed-world
+# replacement asserts the negative instead: read every DRC severity
+# (board.design_settings.rule_severities) and every ERC severity
+# (erc.rule_severities) actually present in the project, and fail on any
+# that is 'ignore' unless explicitly declared in pcb-capability.yml's
+# declared_severity_downgrades with a real reason. A tool that adds a new
+# check next release is covered the day it ships, not the day someone
+# notices it missing from a list.
 REQUIRED_BOARD_RULE_FLOORS = ("min_clearance", "min_track_width", "min_connection")
+
+# SVW-0038: reasons this short or matching one of these tokens (case-folded)
+# are placeholders, not reviews - "the declaration is the review, and an
+# unreviewed declaration is the hole this replaces." Length floor is
+# deliberately generous (real reasons in the brief/README run 40+ chars);
+# this only catches the "reason: TBD" class of non-answer.
+_PLACEHOLDER_REASON_TOKENS = frozenset({"todo", "tbd", "n/a", "na", "reason", "...", "-", "fixme", "xxx", "tk"})
+_MIN_REASON_LENGTH = 8
+
+
+def _is_placeholder_reason(reason: str) -> bool:
+    stripped = reason.strip()
+    return len(stripped) < _MIN_REASON_LENGTH or stripped.casefold() in _PLACEHOLDER_REASON_TOKENS
 
 # KiCad's per-project drc_exclusions entries serialize as
 # "<violation_settings_key>|<...position/uuid fields...>" (PCB_MARKER
@@ -107,18 +91,47 @@ def check_board_rule_floors(pro: dict, report: Report) -> None:
             )
 
 
-def check_rule_severities(pro: dict, report: Report) -> None:
-    severities = ((pro.get("board") or {}).get("design_settings") or {}).get(
-        "rule_severities"
-    ) or {}
-    for key in REQUIRED_ERROR_SEVERITIES:
-        value = severities.get(key)
-        report.check(f"rule_severities.{key} = {value!r}")
-        if value != "error":
-            report.fail(
-                "downgraded_severity",
-                f"rule_severities.{key}={value!r}, must be 'error'",
+def check_rule_severities(
+    pro: dict, cap: capability_mod.Capability | None, report: Report
+) -> None:
+    """RULE 1.2 (SVW-0038): closed-world - nothing may be 'ignore' unless declared.
+
+    Checks both severity dicts KiCad actually maintains: DRC's
+    board.design_settings.rule_severities and ERC's top-level erc.rule_severities
+    (confirmed against a real board, bb-pcb spin2, 2026-07-28 - these are separate
+    dicts with disjoint key namespaces, not one shared table).
+    """
+    drc_severities = ((pro.get("board") or {}).get("design_settings") or {}).get("rule_severities") or {}
+    erc_severities = (pro.get("erc") or {}).get("rule_severities") or {}
+    declared = cap.declared_severity_downgrades_by_check() if cap else {}
+
+    report.check(
+        f"rule_severities closed-world check: {len(drc_severities)} DRC + {len(erc_severities)} ERC "
+        "severit(y/ies) present - none may be 'ignore' unless declared in pcb-capability.yml"
+    )
+
+    for domain, severities in (("DRC", drc_severities), ("ERC", erc_severities)):
+        for check_name in sorted(severities):
+            value = severities[check_name]
+            if value != "ignore":
+                continue
+            downgrade = declared.get(check_name)
+            if downgrade is None:
+                report.fail(
+                    "undeclared_ignored_severity",
+                    f"{domain} check '{check_name}' has severity 'ignore' and is not declared in "
+                    "pcb-capability.yml declared_severity_downgrades - turn it on or declare it with a reason",
+                )
+                continue
+            report.check(
+                f"declared severity downgrade: {domain} '{check_name}' -> ignore ({downgrade.reason!r})"
             )
+            if _is_placeholder_reason(downgrade.reason):
+                report.fail(
+                    "placeholder_severity_downgrade_reason",
+                    f"declared_severity_downgrades entry for '{check_name}' has an empty or placeholder "
+                    f"reason ({downgrade.reason!r}) - the declaration is the review",
+                )
 
 
 def check_drc_exclusions(
@@ -202,12 +215,14 @@ def run(files: ProjectFiles, today: datetime.date | None = None) -> Report:
 
     check_netclasses(pro, report)
     check_board_rule_floors(pro, report)
-    check_rule_severities(pro, report)
 
-    # The capability file gates the exclusion check below (an exclusion can
-    # only be "declared" against a capability file that exists), so load it
-    # first even though its own failures are independent.
+    # SVW-0038: the closed-world severity check and the exclusion check both
+    # need the capability file's declarations, so load it before either -
+    # a missing/invalid capability file still fails its own way
+    # (missing_capability_file), and both downstream checks then see cap=None
+    # and fail closed (nothing can be "declared" without it).
     cap = check_capability_file(files, pro, report, today=today)
+    check_rule_severities(pro, cap, report)
     check_drc_exclusions(pro, cap, report)
 
     return report

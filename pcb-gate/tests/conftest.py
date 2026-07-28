@@ -29,6 +29,7 @@ def make_kicad_pro(
     netclasses=None,
     rules=None,
     severities=None,
+    erc_severities=None,
     exclusions=None,
 ) -> Path:
     netclasses = netclasses if netclasses is not None else [
@@ -49,6 +50,7 @@ def make_kicad_pro(
         "via_dangling": "error",
         "missing_courtyard": "error",
     }
+    erc_severities = erc_severities if erc_severities is not None else {}
     exclusions = exclusions if exclusions is not None else []
 
     data = {
@@ -63,6 +65,9 @@ def make_kicad_pro(
                 "rule_severities": severities,
                 "drc_exclusions": exclusions,
             }
+        },
+        "erc": {
+            "rule_severities": erc_severities,
         },
     }
     path = tmp_path / f"{name}.kicad_pro"
@@ -90,6 +95,13 @@ def make_capability_yml(tmp_path: Path, **overrides) -> Path:
         lines.append("declared_exclusions:")
         for entry in declared:
             lines.append(f"  - rule: {entry['rule']}")
+            lines.append(f"    reason: {entry['reason']}")
+    downgrades = overrides.get("declared_severity_downgrades")
+    if downgrades:
+        lines.append("declared_severity_downgrades:")
+        for entry in downgrades:
+            lines.append(f"  - check: {entry['check']}")
+            lines.append(f"    severity: {entry.get('severity', 'ignore')}")
             lines.append(f"    reason: {entry['reason']}")
     path = tmp_path / "pcb-capability.yml"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -194,6 +206,7 @@ def make_project(
     netclasses=None,
     rules=None,
     severities=None,
+    erc_severities=None,
     exclusions=None,
     with_capability: bool = True,
     capability_overrides: dict | None = None,
@@ -201,7 +214,13 @@ def make_project(
     project_dir = tmp_path / name
     project_dir.mkdir()
     make_kicad_pro(
-        project_dir, name=name, netclasses=netclasses, rules=rules, severities=severities, exclusions=exclusions
+        project_dir,
+        name=name,
+        netclasses=netclasses,
+        rules=rules,
+        severities=severities,
+        erc_severities=erc_severities,
+        exclusions=exclusions,
     )
     make_kicad_pcb(project_dir, name, items or [], layers=layers)
     (project_dir / f"{name}.kicad_sch").write_text("(kicad_sch (version 20231120))\n", encoding="utf-8")

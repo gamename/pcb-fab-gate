@@ -38,6 +38,22 @@ class DeclaredExclusion:
 
 
 @dataclass(frozen=True)
+class DeclaredSeverityDowngrade:
+    """SVW-0038 RULE 1.2: a reviewed, written exception to the closed-world 'no ignore' assertion.
+
+    `check` is the DRC or ERC rule-severity key (e.g. "footprint_type_mismatch",
+    "footprint_filter") - the two severity dicts (board.design_settings.rule_severities
+    for DRC, erc.rule_severities for ERC) are keyed independently, but in practice their
+    key names don't collide, so a single flat `declared_severity_downgrades` list (no
+    drc/erc split) matches the brief's YAML example and keeps the capability file simple.
+    """
+
+    check: str
+    severity: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class Capability:
     fab: str
     retrieved: datetime.date
@@ -45,12 +61,16 @@ class Capability:
     stackup: str
     constraints: dict[str, float]
     declared_exclusions: tuple[DeclaredExclusion, ...] = field(default_factory=tuple)
+    declared_severity_downgrades: tuple[DeclaredSeverityDowngrade, ...] = field(default_factory=tuple)
 
     def age_days(self, today: datetime.date) -> int:
         return (today - self.retrieved).days
 
     def declared_exclusion_rules(self) -> set[str]:
         return {e.rule for e in self.declared_exclusions}
+
+    def declared_severity_downgrades_by_check(self) -> dict[str, DeclaredSeverityDowngrade]:
+        return {d.check: d for d in self.declared_severity_downgrades}
 
 
 def load(capability_file: Path) -> Capability:
@@ -93,6 +113,12 @@ def load(capability_file: Path) -> Capability:
         DeclaredExclusion(rule=e["rule"], reason=e["reason"]) for e in exclusions_raw
     )
 
+    downgrades_raw = raw.get("declared_severity_downgrades") or []
+    downgrades = tuple(
+        DeclaredSeverityDowngrade(check=d["check"], severity=d.get("severity", "ignore"), reason=d["reason"])
+        for d in downgrades_raw
+    )
+
     return Capability(
         fab=str(raw["fab"]),
         retrieved=retrieved,
@@ -100,4 +126,5 @@ def load(capability_file: Path) -> Capability:
         stackup=str(raw["stackup"]),
         constraints={k: float(v) for k, v in constraints.items()},
         declared_exclusions=exclusions,
+        declared_severity_downgrades=downgrades,
     )
