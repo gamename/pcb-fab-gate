@@ -20,6 +20,7 @@ from typing import Callable
 
 from . import arming, keepout, kicad_tools, sexp
 from . import netlist as netlist_mod
+from .layers import pad_geometry
 from .project import ProjectFiles, discover
 from .report import Report
 
@@ -53,16 +54,51 @@ def _all_net_names(root: sexp.Node) -> set[str]:
     return names
 
 
+def _find_anchor_pad(root: sexp.Node, exclude_net: str | None) -> tuple[str, tuple[float, float]] | None:
+    """A real pad's absolute position, on a net other than `exclude_net`, to anchor a
+    canary short to actual circuitry (SVW-0042).
+
+    Skips KiCad's own synthetic `unconnected-(...)` pad nets: a lone unconnected pad
+    can't form a real short with anything else on that "net" and isn't a faithful
+    canary of the defect this checker exists to catch.
+    """
+    for footprint in sexp.children(root, "footprint"):
+        for pad in sexp.children(footprint, "pad"):
+            net_name = sexp.text_of(sexp.child(pad, "net"))
+            if not net_name or net_name == exclude_net or net_name.startswith("unconnected-("):
+                continue
+            geom = pad_geometry(footprint, pad)
+            if geom is None:
+                continue
+            centroid = geom.centroid
+            return net_name, (centroid.x, centroid.y)
+    return None
+
+
 def inject_short(root: sexp.Node) -> bool:
-    """Canary 1: duplicate an existing track onto a different net, offset so it overlaps."""
+    """Canary 1: duplicate an existing track, overlapping the original at one end and
+    anchored to a real pad on a different net at the other.
+
+    Originally both endpoints were just offset from the original segment, leaving the
+    duplicate connected to nothing at either end. Confirmed on a real board (SVW-0042,
+    gni-clock-pcb PR #1, KiCad 10.0.1): `kicad-cli pcb drc` does not evaluate
+    clearance/shorting for a track segment with no connection at either end, against
+    *any* other net, regardless of offset or overlap - so that version's injected
+    defect was silently invisible to DRC. Anchoring one endpoint to a real pad on the
+    target net makes the injected copper an actual short (touching live circuitry on
+    both nets), which DRC does report as `shorting_items` - verified directly against
+    the same real board before this fix landed.
+    """
     segments = list(sexp.children(root, "segment"))
     if not segments:
         return False
     seg = segments[0]
     orig_net = sexp.text_of(sexp.child(seg, "net"))
-    other_nets = [n for n in _all_net_names(root) if n != orig_net]
-    if not other_nets:
+
+    anchor = _find_anchor_pad(root, exclude_net=orig_net)
+    if anchor is None:
         return False
+    target_net, (anchor_x, anchor_y) = anchor
 
     width_node = sexp.child(seg, "width")
     width = sexp.as_float(width_node[1]) if width_node else 0.2
@@ -71,11 +107,13 @@ def inject_short(root: sexp.Node) -> bool:
     import copy as copy_mod
 
     dup = copy_mod.deepcopy(seg)
-    for point_tag in ("start", "end"):
-        point = sexp.child(dup, point_tag)
-        point[1] = str(sexp.as_float(point[1]) + offset)
-        point[2] = str(sexp.as_float(point[2]) + offset)
-    sexp.child(dup, "net")[1] = sexp.qstr(other_nets[0])
+    start = sexp.child(dup, "start")
+    start[1] = str(sexp.as_float(start[1]) + offset)
+    start[2] = str(sexp.as_float(start[2]) + offset)
+    end = sexp.child(dup, "end")
+    end[1] = str(anchor_x)
+    end[2] = str(anchor_y)
+    sexp.child(dup, "net")[1] = sexp.qstr(target_net)
     uuid_node = sexp.child(dup, "uuid")
     if uuid_node is not None:
         uuid_node[1] = _new_uuid()

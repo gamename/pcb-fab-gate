@@ -31,14 +31,45 @@ def test_inject_short_requires_a_segment():
     assert canary.inject_short(root) is False
 
 
-def test_inject_short_adds_offset_segment_on_other_net():
+def test_inject_short_requires_a_real_anchor_pad_on_another_net():
+    """A floating-both-ends duplicate is invisible to DRC's clearance/shorting checks
+    regardless of offset (SVW-0042, confirmed on a real board) - without a real pad to
+    anchor to, the canary must skip rather than inject a defect DRC can't see."""
     root = ["kicad_pcb", segment((0, 0), (5, 0), 0.2, "/A", "seg-1"), segment((10, 10), (15, 10), 0.2, "/B", "seg-2")]
+    assert canary.inject_short(root) is False
+
+
+def test_inject_short_anchors_duplicate_to_a_real_pad_on_another_net():
+    # pad's own local (at) is (0, 0) -- its absolute position is the footprint's
+    # (at 20 20) below, not the sum of the two
+    other_pad = pad("1", "smd", "rect", (0, 0), (1, 1), "/B", "pad-1")
+    root = [
+        "kicad_pcb",
+        segment((0, 0), (5, 0), 0.2, "/A", "seg-1"),
+        footprint("U1", (20, 20), [other_pad]),
+    ]
     before = len(root) - 1
     assert canary.inject_short(root) is True
     assert len(root) - 1 == before + 1
     new_seg = root[-1]
     assert sexp.tag(new_seg) == "segment"
-    assert sexp.text_of(sexp.child(new_seg, "net")) in ("/A", "/B")
+    assert sexp.text_of(sexp.child(new_seg, "net")) == "/B"
+    # the anchored endpoint lands exactly on the real pad's absolute position, not just
+    # offset from the original segment - that's what makes DRC able to see the short
+    end = sexp.child(new_seg, "end")
+    assert (sexp.as_float(end[1]), sexp.as_float(end[2])) == (20.0, 20.0)
+
+
+def test_inject_short_skips_synthetic_unconnected_nets():
+    """A lone KiCad-synthesized 'unconnected-(...)' pad net can't form a real short -
+    not a faithful canary of the defect this checker exists to catch."""
+    stray_pad = pad("1", "smd", "rect", (0, 0), (1, 1), "unconnected-(U1-Pad1)", "pad-1")
+    root = [
+        "kicad_pcb",
+        segment((0, 0), (5, 0), 0.2, "/A", "seg-1"),
+        footprint("U1", (20, 20), [stray_pad]),
+    ]
+    assert canary.inject_short(root) is False
 
 
 def test_inject_narrow_track_sets_small_width():
@@ -296,11 +327,13 @@ def test_harness_fails_when_every_checker_is_stubbed_clean(project_factory):
 
     assert not report.ok
     fire_failures = [v for v in report.violations if v.code == "canary_did_not_fire"]
-    # short, track_width, unconnected, assertion, netlist, arm - keepout canary is
-    # skipped (no ANT_KEEPOUT zone) and parity canary is skipped (no footprint on this
-    # fixture to remove), neither of which is a canary_did_not_fire failure - a
-    # legitimate "no eligible target" skip.
-    assert len(fire_failures) == 6
+    # track_width, unconnected, assertion, netlist, arm - keepout is skipped (no
+    # ANT_KEEPOUT zone), parity is skipped (no footprint on this fixture to remove),
+    # and short is skipped too as of SVW-0042 (no footprint to anchor a real short to
+    # - deliberately the same "no footprint" limitation as parity, not new fixture
+    # debt) - none of those are canary_did_not_fire failures, they're legitimate
+    # "no eligible target" skips.
+    assert len(fire_failures) == 5
 
 
 # --- SVW-0038: netlist canary (RULE 16.4) --------------------------------

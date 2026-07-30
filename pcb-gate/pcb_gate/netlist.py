@@ -160,7 +160,7 @@ def build_lock(files: ProjectFiles) -> dict:
 
     nets = [
         {"name": name, "nodes": sorted(set(nodes), key=natural_key)}
-        for name, nodes in sorted(nets_raw.items())
+        for name, nodes in sorted(nets_raw.items(), key=lambda item: natural_key(item[0]))
     ]
     components = [
         {

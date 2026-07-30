@@ -72,6 +72,43 @@ def test_extract_nets_builds_refdes_dot_pin_nodes():
     assert set(nets["GND"]) == {"C1.1", "U1.10", "U1.2"}
 
 
+# --- build_lock(): net ordering -----------------------------------------
+
+
+def test_build_lock_sorts_nets_with_natural_key_not_lexicographic(tmp_path, monkeypatch):
+    """Regression (SVW-0042): `build_lock()`'s own nets list must sort the same
+    numeric-aware way its nodes already do. A plain `sorted(nets_raw.items())` sorts
+    by the tuple's first element - i.e. lexicographically - putting
+    'unconnected-(U1-Pad10)' before 'unconnected-(U1-Pad9)'. On a re-run, a freshly
+    regenerated lock reorders these back to natural_key order and reports a byte-diff
+    with no semantic difference: `connectivity_lock_churn`, on any board with more
+    than 9 numbered unconnected pins on the same component - not a design change.
+    """
+    export_root = _export_root(
+        components_sexp='(comp (ref "U1") (value "X") (footprint "F"))',
+        nets_sexp=(
+            '(net (code "1") (name "unconnected-(U1-Pad9)") (node (ref "U1") (pin "9"))) '
+            '(net (code "2") (name "unconnected-(U1-Pad10)") (node (ref "U1") (pin "10")))'
+        ),
+    )
+    monkeypatch.setattr(netlist, "_run_netlist_export", lambda sch_file: export_root)
+    monkeypatch.setattr(netlist, "extract_dnp_by_ref", lambda sch_file: {})
+
+    project = tmp_path / "TestBoard"
+    project.mkdir()
+    (project / "TestBoard.kicad_sch").write_text("(kicad_sch (version 20231120))\n", encoding="utf-8")
+    (project / "TestBoard.kicad_pcb").write_text("(kicad_pcb)\n", encoding="utf-8")
+    (project / "TestBoard.kicad_pro").write_text("{}", encoding="utf-8")
+    files = discover(project)
+
+    lock = netlist.build_lock(files)
+
+    assert [n["name"] for n in lock["nets"]] == [
+        "unconnected-(U1-Pad9)",
+        "unconnected-(U1-Pad10)",
+    ]
+
+
 # --- dnp, sourced from the schematic, not the netlist -------------------
 
 
