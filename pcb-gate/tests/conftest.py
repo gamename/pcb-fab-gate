@@ -145,11 +145,11 @@ def footprint(ref, at, pads, angle=None):
     ]
 
 
-def pad(num, kind, shape, at, size, net, uuid, layers=("F.Cu",), angle=None):
+def pad(num, kind, shape, at, size, net, uuid, layers=("F.Cu",), angle=None, roundrect_rratio=None):
     at_node = ["at", str(at[0]), str(at[1])]
     if angle is not None:
         at_node.append(str(angle))
-    return [
+    node = [
         "pad",
         str(num),
         kind,
@@ -160,6 +160,9 @@ def pad(num, kind, shape, at, size, net, uuid, layers=("F.Cu",), angle=None):
         ["net", sexp.qstr(net)],
         ["uuid", sexp.qstr(uuid)],
     ]
+    if roundrect_rratio is not None:
+        node.append(["roundrect_rratio", str(roundrect_rratio)])
+    return node
 
 
 def zone_pour(net, layer, pts, uuid, keepout=False, name=None):

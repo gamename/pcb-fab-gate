@@ -112,3 +112,35 @@ def test_rotated_footprint_pad_conflict_at_real_position_fails(project_factory):
     report = overlap.run(files)
     assert not report.ok
     assert any(v.code == "overlap_clearance" for v in report.violations)
+
+
+def test_roundrect_pad_bbox_corner_not_falsely_flagged(project_factory):
+    # The exact class of false positive found on mansio-pcb spin-2 (2026-07-31,
+    # 24 items): a roundrect pad's bounding-box corner is NOT part of the
+    # pad's real (rounded) copper. A 2x2mm pad at rratio 0.5 is a pure circle
+    # of radius 1 (KiCad's own definition: radius = rratio * min(sx,sy));
+    # its bbox corner at (1,1) is sqrt(2) ~= 1.414mm from center, i.e. ~0.41mm
+    # clear of the true circular edge - comfortably inside the 0.1mm fab
+    # floor. The pre-fix bounding-rect stand-in put pad copper AT (1,1)
+    # exactly, so a different-net track anchored there read as a direct hit.
+    fp = footprint("R11", (0, 0), [pad("1", "smd", "roundrect", (0, 0), (2, 2), "/A", "pad-1", roundrect_rratio=0.5)])
+    files = project_factory(
+        items=[fp, segment((1, 1), (2, 2), 0.02, "/B", "seg-corner")],
+        capability_overrides={"min_clearance_mm": 0.1},
+    )
+    report = overlap.run(files)
+    assert report.ok, [v.message for v in report.violations]
+
+
+def test_roundrect_pad_real_edge_still_flags(project_factory):
+    # Companion to the above: the fix must not make roundrect pads
+    # invisible to the checker. A track anchored well inside the true
+    # circular edge (e.g. (0.5, 0.5), radius 1 from center) must still fail.
+    fp = footprint("R11", (0, 0), [pad("1", "smd", "roundrect", (0, 0), (2, 2), "/A", "pad-1", roundrect_rratio=0.5)])
+    files = project_factory(
+        items=[fp, segment((0.5, 0.5), (2, 2), 0.02, "/B", "seg-inside")],
+        capability_overrides={"min_clearance_mm": 0.1},
+    )
+    report = overlap.run(files)
+    assert not report.ok
+    assert any(v.code == "overlap_clearance" for v in report.violations)
