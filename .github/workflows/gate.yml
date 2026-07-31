@@ -486,8 +486,17 @@ jobs:
           echo "zip_name=$zip_name" >> "$GITHUB_OUTPUT"
 
           # BOM is optional — only some boards have one checked in yet.
+          # Scoped to this job's own project_dir (maxdepth 1, matching how
+          # every other file-discovery step in this workflow scopes itself) —
+          # a repo with more than one gated board (e.g. two spins sharing one
+          # repo) can have same-named BOM*.md files in each project_dir;
+          # searching from the repo root and flattening into one bom/
+          # directory made a same-basename collision an unconditional `cp`
+          # failure the very first time two such boards' releases ran in the
+          # same push (mansio-pcb spin1+spin2, both carrying
+          # bom-digikey-NOTES.md, 2026-07-31).
           mkdir -p bom
-          mapfile -t bom_files < <(find . -not -path './.git/*' -iname 'BOM*.md')
+          mapfile -t bom_files < <(find "${{ inputs.project_dir }}" -maxdepth 1 -iname 'BOM*.md')
           if [ "${#bom_files[@]}" -gt 0 ]; then
             cp "${bom_files[@]}" bom/
           fi
