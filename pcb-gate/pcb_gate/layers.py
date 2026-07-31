@@ -88,27 +88,55 @@ def _pad_shape(pad: sexp.Node) -> str:
     return "rect"
 
 
-def _pad_local_outline(shape: str, sx: float, sy: float) -> Polygon:
+def _pad_roundrect_ratio(pad: sexp.Node) -> float:
+    node = sexp.child(pad, "roundrect_rratio")
+    if node is None or len(node) < 2:
+        return 0.0
+    try:
+        return sexp.as_float(node[1])
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pad_local_outline(shape: str, sx: float, sy: float, rratio: float = 0.0) -> Polygon:
     """A pad's own outline before pad-angle/footprint-angle/position are applied.
 
-    circle/oval are exact (a circle is a degenerate oval); rect is exact.
-    roundrect/trapezoid/custom fall back to the full bounding rectangle - a
-    conservative (never-smaller) stand-in, not a true outline. That fallback
-    is the known, expected source of first-run false positives against
-    KiCad's real DRC engine near rounded corners (RULE 8.1: root-cause, don't
-    suppress) - circle/oval were fixed here because GNI-0283's first
-    real-board run hit exactly that case on a THT circular pad.
+    circle/oval/rect/roundrect are exact; trapezoid/custom fall back to the
+    full bounding rectangle - a conservative (never-smaller) stand-in, not a
+    true outline. That fallback is the known, expected source of first-run
+    false positives against KiCad's real DRC engine near non-rectangular
+    corners (RULE 8.1: root-cause, don't suppress) - circle/oval were fixed
+    here because GNI-0283's first real-board run hit exactly that case on a
+    THT circular pad; roundrect was fixed after mansio-pcb's spin-2 board
+    (2026-07-31) showed 24 false overlap_clearance hits against 0805/SOD-323
+    SMD pads (KiCad's default roundrect shape for both footprint families) -
+    `kicad-cli pcb drc`, which knows the real rounded-corner geometry,
+    reported 0 violations on the same board.
+
+    roundrect's corner radius is `roundrect_rratio * min(sx, sy)` (KiCad's own
+    definition - the ratio is always against the SHORTER side, even for a
+    non-square pad). Built as the Minkowski sum of the inset rectangle with a
+    disk of that radius (`box(...).buffer(radius, join_style="round")`) -
+    shapely's standard technique for a rounded rectangle, not an
+    approximation itself. `rratio` is clamped to 0.5 (KiCad's own UI maximum;
+    a larger value would invert the inset rectangle) and a non-positive
+    result (rratio <= 0) falls back to the plain rectangle, since that's
+    exactly what a 0-ratio roundrect is.
     """
     if shape in ("circle", "oval"):
         unit_circle = Point(0, 0).buffer(1.0, quad_segs=16)
         return shapely_scale(unit_circle, sx / 2, sy / 2, origin=(0, 0))
+    if shape == "roundrect" and rratio > 0:
+        radius = min(rratio, 0.5) * min(sx, sy)
+        inset = box(-sx / 2 + radius, -sy / 2 + radius, sx / 2 - radius, sy / 2 - radius)
+        return inset.buffer(radius, quad_segs=16, join_style="round")
     return box(-sx / 2, -sy / 2, sx / 2, sy / 2)
 
 
 def pad_geometry(footprint: sexp.Node, pad: sexp.Node) -> Polygon | None:
     """A pad's absolute-position outline, footprint placement and rotation applied.
 
-    Shape-aware for circle/oval/rect (exact); roundrect/trapezoid/custom use a
+    Shape-aware for circle/oval/rect/roundrect (exact); trapezoid/custom use a
     conservative bounding-rectangle stand-in - see `_pad_local_outline`.
 
     Rotation convention (SVW-0043): KiCad board coordinates are y-down, and a
@@ -138,7 +166,7 @@ def pad_geometry(footprint: sexp.Node, pad: sexp.Node) -> Polygon | None:
     p_angle = sexp.as_float(pad_at[3]) if len(pad_at) > 3 else 0.0
     sx, sy = sexp.as_float(size_node[1]), sexp.as_float(size_node[2])
 
-    local = _pad_local_outline(_pad_shape(pad), sx, sy)
+    local = _pad_local_outline(_pad_shape(pad), sx, sy, _pad_roundrect_ratio(pad))
     # Absolute shape angle, mapped into shapely's y-up frame.
     local = shapely_rotate(local, -p_angle, origin=(0, 0))
     # Pad offset rotates with the footprint, y-down convention.
