@@ -204,10 +204,30 @@ jobs:
             --report canary.json
 
       - name: ERC (schematic)
+        # SVW-0043: --exit-code-violations counts EXCLUDED entries toward the
+        # exit code, so a documented, arm-validated exclusion could never pass
+        # the gate. Run at full reporting completeness, then adjudicate the
+        # JSON ourselves: any entry not marked excluded fails; excluded
+        # entries are printed loudly (arm separately fails any exclusion not
+        # declared in pcb-capability.yml, so passing here is never silent).
         if: always()
         run: |
-          kicad-cli sch erc --severity-all --exit-code-violations \
+          kicad-cli sch erc --severity-all \
             --format json -o erc.json "${{ steps.discover.outputs.sch_file }}"
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("erc.json"))
+          live, excluded = [], []
+          for sheet in d.get("sheets", []):
+              for v in sheet.get("violations", []):
+                  (excluded if v.get("excluded") else live).append(v)
+          for v in excluded:
+              print(f"[gate erc] EXCLUDED (arm-validated): {v.get('type')}: {v.get('description')} :: {v.get('comment','')}")
+          for v in live:
+              print(f"[gate erc] VIOLATION: {v.get('type')} ({v.get('severity')}): {v.get('description')}")
+          print(f"[gate erc] {len(live)} violation(s), {len(excluded)} excluded")
+          sys.exit(1 if live else 0)
+          PY
 
       - name: DRC (board)
         # Defect 1: --all-track-errors, --schematic-parity and --refill-zones
@@ -220,8 +240,22 @@ jobs:
         if: always()
         run: |
           kicad-cli pcb drc --all-track-errors --schematic-parity --refill-zones \
-            --severity-all --exit-code-violations \
+            --severity-all \
             --format json -o drc.json "${{ steps.discover.outputs.pcb_file }}"
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("drc.json"))
+          live, excluded = [], []
+          for section in ("violations", "unconnected_items", "schematic_parity"):
+              for v in d.get(section, []):
+                  (excluded if v.get("excluded") else live).append((section, v))
+          for section, v in excluded:
+              print(f"[gate drc] EXCLUDED (arm-validated) [{section}]: {v.get('type')}: {v.get('description')} :: {v.get('comment','')}")
+          for section, v in live:
+              print(f"[gate drc] VIOLATION [{section}]: {v.get('type')} ({v.get('severity')}): {v.get('description')}")
+          print(f"[gate drc] {len(live)} violation(s), {len(excluded)} excluded")
+          sys.exit(1 if live else 0)
+          PY
 
       - name: Netlist (GATE 15 / RULE 16.x - connectivity regression)
         # Compares the committed connectivity.lock.json against a fresh
@@ -498,7 +532,7 @@ jobs:
             echo "**Gate results (SVW-0034):**"
             check_line "Arm (RULE 1.2 / GATE 2)" "arm.json"
             check_line "Canary (GATE 1)" "canary.json"
-            echo "- **ERC/DRC:** 0 violations required (kicad-cli --severity-all --exit-code-violations)"
+            echo "- **ERC/DRC:** 0 unexcluded violations required (kicad-cli --severity-all + JSON adjudication; exclusions must be declared in pcb-capability.yml)"
             check_line "Netlist (GATE 15 / RULE 16.x)" "netlist.json"
             check_line "Keepout (GATE 6)" "keepout.json"
             check_line "Overlap (GATE 5)" "overlap.json"

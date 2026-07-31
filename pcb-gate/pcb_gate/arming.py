@@ -160,6 +160,45 @@ def check_drc_exclusions(
             )
 
 
+def check_erc_exclusions(
+    pro: dict, cap: capability_mod.Capability | None, report: Report
+) -> None:
+    """SVW-0043: same closed-world contract as check_drc_exclusions, for ERC.
+
+    KiCad serializes erc.erc_exclusions as [marker_string, comment] pairs
+    (observed on a real board, KiCad 10: the marker is
+    "<check_name>|<x>|<y>|<uuid...>" and the comment is the reviewer's free
+    text). Older/hand-edited projects may carry bare strings; both forms are
+    handled, and an entry this parser can't decode is printed raw and FAILED,
+    never swallowed.
+    """
+    exclusions = (pro.get("erc") or {}).get("erc_exclusions") or []
+    report.check(f"erc.erc_exclusions: {len(exclusions)} entr(y/ies)")
+    if not exclusions:
+        return
+
+    declared = cap.declared_exclusion_rules() if cap else set()
+    for entry in exclusions:
+        if isinstance(entry, list) and entry and isinstance(entry[0], str):
+            raw, comment = entry[0], (entry[1] if len(entry) > 1 and isinstance(entry[1], str) else "")
+        elif isinstance(entry, str):
+            raw, comment = entry, ""
+        else:
+            report.fail(
+                "undecodable_erc_exclusion",
+                f"erc_exclusions entry has an unrecognized shape: {entry!r}",
+            )
+            continue
+        rule_name = _exclusion_rule_name(raw)
+        report.check(f"ERC exclusion present: rule={rule_name!r} comment={comment!r} raw={raw!r}")
+        if rule_name not in declared:
+            report.fail(
+                "undeclared_erc_exclusion",
+                f"ERC exclusion for rule={rule_name!r} is not listed in pcb-capability.yml "
+                "declared_exclusions - an exclusion must be a committed decision, not a silent one",
+            )
+
+
 def check_capability_file(
     files: ProjectFiles, pro: dict, report: Report, today: datetime.date | None = None
 ) -> capability_mod.Capability | None:
@@ -224,5 +263,6 @@ def run(files: ProjectFiles, today: datetime.date | None = None) -> Report:
     cap = check_capability_file(files, pro, report, today=today)
     check_rule_severities(pro, cap, report)
     check_drc_exclusions(pro, cap, report)
+    check_erc_exclusions(pro, cap, report)
 
     return report

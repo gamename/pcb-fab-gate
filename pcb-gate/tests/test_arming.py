@@ -169,3 +169,51 @@ def test_declared_exclusion_does_not_fail(project_factory):
     )
     report = arming.run(files, today=TODAY)
     assert report.ok, report.violations
+
+
+def _pro_with_erc_exclusion(comment="GNI-0288: documented safe-by-design pin_to_pin exclusion"):
+    return {
+        "erc": {
+            "erc_exclusions": [
+                ["pin_to_pin|431800|990600|uuid-a|uuid-b|/sheet|/sheet|/sheet", comment]
+            ]
+        }
+    }
+
+
+def test_undeclared_erc_exclusion_fails(project_factory, monkeypatch):
+    from pcb_gate import arming, capability
+    from pcb_gate.report import Report
+
+    report = Report(tool="pcb-gate arm", project="t")
+    cap = capability.Capability(
+        fab="F", retrieved=__import__("datetime").date.today(), source="s", stackup="s",
+        constraints={}, declared_exclusions=(), declared_severity_downgrades=(),
+    )
+    arming.check_erc_exclusions(_pro_with_erc_exclusion(), cap, report)
+    assert any(v.code == "undeclared_erc_exclusion" for v in report.violations)
+
+
+def test_declared_erc_exclusion_passes(project_factory):
+    from pcb_gate import arming, capability
+    from pcb_gate.report import Report
+
+    report = Report(tool="pcb-gate arm", project="t")
+    cap = capability.Capability(
+        fab="F", retrieved=__import__("datetime").date.today(), source="s", stackup="s",
+        constraints={},
+        declared_exclusions=(capability.DeclaredExclusion(rule="pin_to_pin", reason="documented safe-by-design, see board notes"),),
+        declared_severity_downgrades=(),
+    )
+    arming.check_erc_exclusions(_pro_with_erc_exclusion(), cap, report)
+    assert not any(v.code.startswith("undeclared") for v in report.violations)
+
+
+def test_bare_string_erc_exclusion_is_handled(project_factory):
+    from pcb_gate import arming
+    from pcb_gate.report import Report
+
+    report = Report(tool="pcb-gate arm", project="t")
+    pro = {"erc": {"erc_exclusions": ["pin_to_pin|1|2|u1|u2"]}}
+    arming.check_erc_exclusions(pro, None, report)
+    assert any(v.code == "undeclared_erc_exclusion" for v in report.violations)
