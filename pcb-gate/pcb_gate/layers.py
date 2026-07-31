@@ -1,6 +1,8 @@
 """Copper-layer helpers shared by keepout.py and overlap.py."""
 from __future__ import annotations
 
+import math
+
 from shapely.affinity import rotate as shapely_rotate
 from shapely.affinity import scale as shapely_scale
 from shapely.affinity import translate as shapely_translate
@@ -108,6 +110,19 @@ def pad_geometry(footprint: sexp.Node, pad: sexp.Node) -> Polygon | None:
 
     Shape-aware for circle/oval/rect (exact); roundrect/trapezoid/custom use a
     conservative bounding-rectangle stand-in - see `_pad_local_outline`.
+
+    Rotation convention (SVW-0043): KiCad board coordinates are y-down, and a
+    positive stored angle rotates counter-clockwise ON SCREEN - in y-down axes
+    that is (x*cos + y*sin, -x*sin + y*cos), the INVERSE of shapely's y-up
+    counter-clockwise `rotate`. The pad's own stored angle is absolute in
+    board files (KiCad's writer stores footprint + pad-local summed), so the
+    shape is rotated by the pad angle alone and only the pad's OFFSET rotates
+    with the footprint angle. The previous +angle/+angle form evaluated every
+    pad of every rotated footprint at a mirrored phantom position - found on
+    gni-ol-pcb spin-3, where U1 (a 44-pin DevKitC at 90 deg) had its real pad
+    at (121.08, 110) checked at (110.92, 110), producing 29 false
+    overlap_clearance hits against copper that was >4 mm clear in reality,
+    while leaving the pads' REAL neighbourhoods unchecked.
     """
     fp_at = sexp.child(footprint, "at")
     if fp_at is None:
@@ -124,8 +139,10 @@ def pad_geometry(footprint: sexp.Node, pad: sexp.Node) -> Polygon | None:
     sx, sy = sexp.as_float(size_node[1]), sexp.as_float(size_node[2])
 
     local = _pad_local_outline(_pad_shape(pad), sx, sy)
-    local = shapely_rotate(local, p_angle, origin=(0, 0))
-    local = shapely_translate(local, px, py)
-    local = shapely_rotate(local, f_angle, origin=(0, 0))
-    local = shapely_translate(local, fx, fy)
-    return local
+    # Absolute shape angle, mapped into shapely's y-up frame.
+    local = shapely_rotate(local, -p_angle, origin=(0, 0))
+    # Pad offset rotates with the footprint, y-down convention.
+    th = math.radians(f_angle)
+    wx = px * math.cos(th) + py * math.sin(th)
+    wy = -px * math.sin(th) + py * math.cos(th)
+    return shapely_translate(local, fx + wx, fy + wy)

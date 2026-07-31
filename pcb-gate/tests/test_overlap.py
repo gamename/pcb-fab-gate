@@ -72,3 +72,43 @@ def test_pad_vs_pad_different_net_too_close_fails(project_factory):
     report = overlap.run(files)
     assert not report.ok
     assert any(v.code == "overlap_clearance" for v in report.violations)
+
+
+def test_rotated_footprint_pad_checked_at_real_position_not_phantom(project_factory):
+    # SVW-0043 regression: a footprint at 90 deg has its pad offset rotated
+    # y-down, so pad 3 of fp (116,110) rel (0,5.08) lives at (121.08,110).
+    # The pre-fix +angle rotation evaluated it at the mirrored phantom
+    # (110.92,110). A segment hugging the PHANTOM position must NOT flag...
+    files = project_factory(
+        items=[
+            footprint(
+                "U1",
+                (116, 110),
+                [pad("3", "thru_hole", "circle", (0, 5.08), (1.2, 1.2), "/RST", "pu3")],
+                angle=90,
+            ),
+            segment((110.9, 105), (110.9, 115), 0.4, "/OTHER", "seg-phantom"),
+        ],
+        capability_overrides={"min_clearance_mm": 0.1},
+    )
+    report = overlap.run(files)
+    assert report.ok, [v.message for v in report.violations]
+
+
+def test_rotated_footprint_pad_conflict_at_real_position_fails(project_factory):
+    # ...and a segment crossing the REAL position (121.08,110) must flag.
+    files = project_factory(
+        items=[
+            footprint(
+                "U1",
+                (116, 110),
+                [pad("3", "thru_hole", "circle", (0, 5.08), (1.2, 1.2), "/RST", "pu3")],
+                angle=90,
+            ),
+            segment((121.08, 105), (121.08, 115), 0.4, "/OTHER", "seg-real"),
+        ],
+        capability_overrides={"min_clearance_mm": 0.1},
+    )
+    report = overlap.run(files)
+    assert not report.ok
+    assert any(v.code == "overlap_clearance" for v in report.violations)
