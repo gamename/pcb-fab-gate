@@ -381,7 +381,13 @@ jobs:
             printf '%s\n' "$message" >&2
             exit 1
           fi
-          num=$(printf '%s' "$tagged_line" | grep -oE "\\[${id_prefix}-[0-9]+\\]" | head -1 | grep -oE '[0-9]+')
+          tag_token=$(printf '%s' "$tagged_line" | grep -oE "\\[${id_prefix}-[0-9]+\\]" | head -1)
+          # Strip the literal "[<ID_PREFIX>-" and "]" instead of grepping for
+          # digits: a prefix that itself contains a digit (MH2) made
+          # `grep -oE '[0-9]+'` emit "2" and "0061" on separate lines, which
+          # corrupted GITHUB_OUTPUT ("Invalid format '0061-<sha>'").
+          num="${tag_token#"[${id_prefix}-"}"
+          num="${num%]}"
           prefix_lower=$(printf '%s' "$id_prefix" | tr '[:upper:]' '[:lower:]')
           short_sha="${GITHUB_SHA:0:7}"
           {
