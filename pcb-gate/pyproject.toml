@@ -18,6 +18,9 @@ test = ["pytest>=7.0"]
 [project.scripts]
 pcb-gate = "pcb_gate.cli:main"
 
+[tool.setuptools.package-data]
+pcb_gate = ["*.csv"]
+
 [tool.setuptools.packages.find]
 include = ["pcb_gate*"]
 
