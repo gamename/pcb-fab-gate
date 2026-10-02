@@ -3,7 +3,7 @@
 Every subcommand discovers the project, runs its check, prints what it
 checked, writes a JSON report, and exits non-zero on any violation - the
 same contract `kicad-cli pcb drc` already follows, so the workflow can treat
-all seven checks (arm, canary, ERC, DRC, netlist, keepout, overlap) uniformly.
+all the checks (arm, canary, ERC, DRC, netlist, keepout, overlap, cpl) uniformly.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import arming, canary, keepout, netlist, overlap
+from . import arming, canary, cpl, keepout, netlist, overlap
 from .project import ProjectError, discover
 from .report import Report
 
@@ -21,6 +21,7 @@ SUBCOMMANDS = {
     "keepout": keepout.run,
     "overlap": overlap.run,
     "netlist": netlist.run,
+    "cpl": cpl.run,
 }
 
 # Defect 2 (Task 2): both `keepout` and `canary` need to agree on which rule
@@ -33,6 +34,8 @@ RF_BOARD_SUBCOMMANDS = {"keepout"}
 # `netlist` verifies the committed lock against a fresh regeneration and
 # fails on any difference (RULE 16.1 - the lock is generated, never hand-edited).
 WRITE_SUBCOMMANDS = {"netlist"}
+# SVW-0070: `cpl` generates the JLCPCB BOM + CPL into --out-dir and checks them.
+CPL_SUBCOMMANDS = {"cpl"}
 
 
 def _default_report_path(project_dir: Path, subcommand: str) -> Path:
@@ -71,6 +74,14 @@ def main(argv: list[str] | None = None) -> int:
                 help="Generate/refresh connectivity.lock.json instead of verifying it",
             )
 
+        if name in CPL_SUBCOMMANDS:
+            sub.add_argument("--out-dir", default="jlc", help="Directory the BOM, CPL and summary are written to")
+            sub.add_argument(
+                "--cpl-include-tht",
+                action="store_true",
+                help="Include through-hole footprints (default: SMD only)",
+            )
+
     args = parser.parse_args(argv)
 
     try:
@@ -87,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
         kwargs["rf_board"] = args.rf_board
     if args.subcommand in WRITE_SUBCOMMANDS:
         kwargs["write"] = args.write
+
+    if args.subcommand in CPL_SUBCOMMANDS:
+        kwargs["out_dir"] = args.out_dir
+        kwargs["include_tht"] = args.cpl_include_tht
 
     report: Report = check_fn(files, **kwargs)
 

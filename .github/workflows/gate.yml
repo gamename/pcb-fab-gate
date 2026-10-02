@@ -74,6 +74,16 @@ name: PCB Fab Gate
 # whose schematics don't populate Manufacturer/MPN yet are skipped
 # gracefully (a log line, not a failure) so this stays usable by callers
 # that haven't done that field work.
+#
+# SVW-0070: for fabricator-assembled boards the order package is Gerber/drill
+# zip + assembly BOM + CPL. After the Gerber/drill export, `pcb-gate cpl`
+# generates a JLCPCB-ready CPL (<Board>-JlcCpl-<tag>.csv) and assembly BOM
+# (<Board>-JlcBom-<tag>.csv, LCSC part numbers from an optional `LCSC` symbol
+# field) and fails the gate unless BOM and CPL agree with each other and the
+# CPL matches an independent re-derivation from the .kicad_pcb. Both files are
+# attached to the release next to the zip. Gerbers, drill and CPL are all
+# exported at the absolute board origin (kicad-cli's default for all three,
+# independent of the board's useauxorigin setting - verified, not assumed).
 
 on:
   workflow_call:
@@ -93,6 +103,11 @@ on:
         default: "ANT_KEEPOUT"
       rf_board:
         description: "When true, a board with no matching keepout rule area FAILS the gate instead of skipping the check. Leave false for a non-RF board where 'no keepout zone' is a correct, expected state."
+        required: false
+        type: boolean
+        default: false
+      cpl_include_tht:
+        description: "SVW-0070: include through-hole footprints in the JLCPCB CPL and assembly BOM. Default false = SMD only (through-hole parts are normally hand-soldered, not placed by the assembler)."
         required: false
         type: boolean
         default: false
@@ -309,12 +324,37 @@ jobs:
           echo "fab_dir=fab-${short_sha}" >> "$GITHUB_OUTPUT"
           mkdir -p "fab-${short_sha}"
           kicad-cli pcb export gerbers -o "fab-${short_sha}" "${{ steps.discover.outputs.pcb_file }}"
-          kicad-cli pcb export drill -o "fab-${short_sha}" "${{ steps.discover.outputs.pcb_file }}"
+          # SVW-0070: absolute is kicad-cli's default; stated explicitly so
+          # drill, Gerbers and the CPL below can never silently diverge.
+          # (Gerbers and `pos` take no origin flag = absolute origin.)
+          kicad-cli pcb export drill --drill-origin absolute -o "fab-${short_sha}" "${{ steps.discover.outputs.pcb_file }}"
           # RULE 16.6: the lock is a fab artifact - it ships inside the fab
           # package itself so the connectivity that was verified is
           # recoverable from the release, not reconstructed from the repo
           # at some later date.
           cp "${{ inputs.project_dir }}/connectivity.lock.json" "fab-${short_sha}/"
+
+      - name: JLCPCB BOM + CPL (SVW-0070) - generate and verify
+        # Runs after the Gerber/drill export and before anything is uploaded:
+        # a failing `pcb-gate cpl` fails the gate, so only gated boards emit.
+        id: jlc
+        if: success()
+        run: |
+          set -euo pipefail
+          args=(--project-dir "${{ inputs.project_dir }}" --out-dir jlc --report jlc/cpl.json)
+          if [ "${{ inputs.cpl_include_tht }}" = "true" ]; then
+            args+=(--cpl-include-tht)
+          fi
+          mkdir -p jlc
+          pcb-gate cpl "${args[@]}"
+          rm -f jlc/kicad_pos.csv jlc/kicad_bom_raw.csv
+
+      - name: Upload JLCPCB BOM + CPL artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jlc-${{ steps.discover.outputs.base_name }}
+          path: jlc/
 
       - name: Upload fab artifact
         if: success()
@@ -430,6 +470,13 @@ jobs:
           name: bom-raw-${{ needs.fab-gate.outputs.base_name }}
           path: bom-raw
 
+      - name: Download JLCPCB BOM + CPL
+        if: steps.existing.outputs.skip == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: jlc-${{ needs.fab-gate.outputs.base_name }}
+          path: jlc
+
       - name: Build DigiKey BOM CSV
         # Skips gracefully (has_bom=false, no failure) when every row's MPN
         # column came back empty -- the signal that this board's schematic
@@ -516,6 +563,22 @@ jobs:
             echo "digikey_name=$digikey_name" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Name JLCPCB BOM + CPL assets
+        # SVW-0070: <Board>-JlcCpl-<tag>.csv / <Board>-JlcBom-<tag>.csv.
+        # Always emitted (even with no LCSC numbers); the release notes carry
+        # the "N of M assembly lines have no LCSC number" count.
+        if: steps.existing.outputs.skip == 'false'
+        id: jlcnames
+        run: |
+          set -euo pipefail
+          base="${{ needs.fab-gate.outputs.base_name }}"
+          tag="${{ steps.rel.outputs.tag }}"
+          mv jlc/jlc_cpl.csv "$base-JlcCpl-$tag.csv"
+          mv jlc/jlc_bom.csv "$base-JlcBom-$tag.csv"
+          echo "cpl_name=$base-JlcCpl-$tag.csv" >> "$GITHUB_OUTPUT"
+          echo "bom_name=$base-JlcBom-$tag.csv" >> "$GITHUB_OUTPUT"
+          echo "lcsc_note=$(jq -r .note jlc/jlc_summary.json)" >> "$GITHUB_OUTPUT"
+
       - name: Compose release notes
         if: steps.existing.outputs.skip == 'false'
         run: |
@@ -551,6 +614,9 @@ jobs:
             check_line "Netlist (GATE 15 / RULE 16.x)" "netlist.json"
             check_line "Keepout (GATE 6)" "keepout.json"
             check_line "Overlap (GATE 5)" "overlap.json"
+            check_line "CPL/BOM (SVW-0070)" "../jlc/cpl.json"
+            echo
+            echo "**JLCPCB assembly outputs:** \`${{ steps.jlcnames.outputs.cpl_name }}\` + \`${{ steps.jlcnames.outputs.bom_name }}\` — ${{ steps.jlcnames.outputs.lcsc_note }}. Orientation is not CI-checkable: compare JLCPCB's placement preview against the 3D view before ordering (pcb-prefab-review)."
             echo
             echo "This zip is the exact fab package that passed the gate — not a hand export."
           } > notes.md
@@ -569,6 +635,7 @@ jobs:
           if [ "${{ steps.digikey.outputs.has_bom }}" = "true" ]; then
             assets+=("${{ steps.assets.outputs.digikey_name }}")
           fi
+          assets+=("${{ steps.jlcnames.outputs.cpl_name }}" "${{ steps.jlcnames.outputs.bom_name }}" "jlc/cpl.json#cpl-report.json")
           gh release create "${{ steps.rel.outputs.tag }}" \
             --repo "${{ github.repository }}" \
             --title "${{ steps.rel.outputs.tag }}" \
