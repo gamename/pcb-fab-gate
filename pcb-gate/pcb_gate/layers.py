@@ -6,7 +6,8 @@ import math
 from shapely.affinity import rotate as shapely_rotate
 from shapely.affinity import scale as shapely_scale
 from shapely.affinity import translate as shapely_translate
-from shapely.geometry import Point, Polygon, box
+from shapely.geometry import LineString, Point, Polygon, box
+from shapely.ops import unary_union
 from shapely.validation import make_valid
 
 from . import sexp
@@ -167,6 +168,12 @@ def pad_geometry(footprint: sexp.Node, pad: sexp.Node) -> Polygon | None:
     sx, sy = sexp.as_float(size_node[1]), sexp.as_float(size_node[2])
 
     local = _pad_local_outline(_pad_shape(pad), sx, sy, _pad_roundrect_ratio(pad))
+    return _place_pad_outline(local, (fx, fy, f_angle), (px, py, p_angle))
+
+
+def _place_pad_outline(local, fp_pose: tuple[float, float, float], pad_pose: tuple[float, float, float]):
+    fx, fy, f_angle = fp_pose
+    px, py, p_angle = pad_pose
     # Absolute shape angle, mapped into shapely's y-up frame.
     local = shapely_rotate(local, -p_angle, origin=(0, 0))
     # Pad offset rotates with the footprint, y-down convention.
@@ -174,3 +181,69 @@ def pad_geometry(footprint: sexp.Node, pad: sexp.Node) -> Polygon | None:
     wx = px * math.cos(th) + py * math.sin(th)
     wy = -px * math.sin(th) + py * math.cos(th)
     return shapely_translate(local, fx + wx, fy + wy)
+
+
+def _primitive_xy(primitive: sexp.Node, name: str) -> tuple[float, float]:
+    node = sexp.child(primitive, name)
+    return sexp.as_float(node[1]), sexp.as_float(node[2])
+
+
+def _primitive_outline(primitive: sexp.Node):
+    """One custom-pad primitive as a filled outline, stroke included. None if the kind isn't supported."""
+    kind = sexp.tag(primitive)
+    if kind == "gr_rect":
+        (x0, y0), (x1, y1) = _primitive_xy(primitive, "start"), _primitive_xy(primitive, "end")
+        outline = box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+    elif kind == "gr_poly":
+        outline = safe_polygon(read_xy_points(sexp.child(primitive, "pts")))
+    elif kind == "gr_circle":
+        (cx, cy), (ex, ey) = _primitive_xy(primitive, "center"), _primitive_xy(primitive, "end")
+        outline = Point(cx, cy).buffer(math.hypot(ex - cx, ey - cy), quad_segs=16)
+    elif kind == "gr_line":
+        outline = LineString([_primitive_xy(primitive, "start"), _primitive_xy(primitive, "end")])
+    else:
+        return None
+    width_node = sexp.child(primitive, "width")
+    width = sexp.as_float(width_node[1]) if width_node else 0.0
+    return outline.buffer(width / 2, quad_segs=16) if outline is not None and width > 0 else outline
+
+
+def pad_land_geometry(footprint: sexp.Node, pad: sexp.Node):
+    """A pad's full absolute copper outline, or None if it can't be built.
+
+    Unlike `pad_geometry`, this includes the primitives of a custom pad, whose
+    `size` is only its anchor (mh2-pcb IC1's custom pads extend well past theirs),
+    and a through-hole pad's shape offset from its drill. `pad_geometry` stays as
+    it is because `overlap` and `keepout` results depend on it.
+    """
+    anchor = pad_geometry(footprint, pad)
+    if anchor is None:
+        return None
+    fp_at, pad_at = sexp.child(footprint, "at"), sexp.child(pad, "at")
+    fp_pose = (
+        sexp.as_float(fp_at[1]),
+        sexp.as_float(fp_at[2]),
+        sexp.as_float(fp_at[3]) if len(fp_at) > 3 else 0.0,
+    )
+    pad_pose = (
+        sexp.as_float(pad_at[1]),
+        sexp.as_float(pad_at[2]),
+        sexp.as_float(pad_at[3]) if len(pad_at) > 3 else 0.0,
+    )
+    size_node = sexp.child(pad, "size")
+    sx, sy = sexp.as_float(size_node[1]), sexp.as_float(size_node[2])
+    parts = [_pad_local_outline(_pad_shape(pad), sx, sy, _pad_roundrect_ratio(pad))]
+
+    primitives = sexp.child(pad, "primitives")
+    for primitive in primitives[1:] if primitives else []:
+        outline = _primitive_outline(primitive)
+        if outline is None:
+            return None
+        parts.append(outline)
+
+    local = unary_union(parts)
+    drill = sexp.child(pad, "drill")
+    offset = sexp.child(drill, "offset") if drill else None
+    if offset is not None:
+        local = shapely_translate(local, sexp.as_float(offset[1]), sexp.as_float(offset[2]))
+    return _place_pad_outline(local, fp_pose, pad_pose)

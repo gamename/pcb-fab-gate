@@ -84,6 +84,12 @@ name: PCB Fab Gate
 # attached to the release next to the zip. Gerbers, drill and CPL are all
 # exported at the absolute board origin (kicad-cli's default for all three,
 # independent of the board's useauxorigin setting - verified, not assumed).
+#
+# SVW-0082: `pcb-gate via-in-pad` enforces RULE 10.2. A same-net via inside a
+# pad is legal copper, so no other step sees it (mh2-egg-carrier-v2 passed with
+# 16 of 18 vias in pads). Expect boards to go red: every intentional via, such
+# as an exposed-pad thermal via, must be declared per pad in
+# pcb-capability.yml declared_vias_in_pads with a count and a reason.
 
 on:
   workflow_call:
@@ -299,6 +305,11 @@ jobs:
         run: |
           pcb-gate overlap --project-dir "${{ inputs.project_dir }}" --report overlap.json
 
+      - name: Via-in-pad (RULE 10.2 - no unfilled via in a solderable land)
+        if: always()
+        run: |
+          pcb-gate via-in-pad --project-dir "${{ inputs.project_dir }}" --report viainpad.json
+
       - name: Upload check reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -312,6 +323,7 @@ jobs:
             netlist.json
             keepout.json
             overlap.json
+            viainpad.json
           if-no-files-found: warn
 
       - name: Export gerbers + drill
@@ -614,6 +626,7 @@ jobs:
             check_line "Netlist (GATE 15 / RULE 16.x)" "netlist.json"
             check_line "Keepout (GATE 6)" "keepout.json"
             check_line "Overlap (GATE 5)" "overlap.json"
+            check_line "Via-in-pad (RULE 10.2)" "viainpad.json"
             check_line "CPL/BOM (SVW-0070)" "../jlc/cpl.json"
             echo
             echo "**JLCPCB assembly outputs:** \`${{ steps.jlcnames.outputs.cpl_name }}\` + \`${{ steps.jlcnames.outputs.bom_name }}\` — ${{ steps.jlcnames.outputs.lcsc_note }}. Orientation is not CI-checkable: compare JLCPCB's placement preview against the 3D view before ordering (pcb-prefab-review)."

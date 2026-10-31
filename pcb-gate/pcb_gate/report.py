@@ -2,8 +2,8 @@
 
 Every checker prints what it checked (RULE 1.2: arming assertions are
 explicit and enumerated, not implied) and writes the same JSON shape so the
-workflow can upload arm.json / canary.json / keepout.json / overlap.json
-alongside erc.json / drc.json.
+workflow can upload arm.json / canary.json / keepout.json / overlap.json /
+viainpad.json alongside erc.json / drc.json.
 """
 from __future__ import annotations
 

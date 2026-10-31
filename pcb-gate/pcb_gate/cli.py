@@ -3,7 +3,7 @@
 Every subcommand discovers the project, runs its check, prints what it
 checked, writes a JSON report, and exits non-zero on any violation - the
 same contract `kicad-cli pcb drc` already follows, so the workflow can treat
-all the checks (arm, canary, ERC, DRC, netlist, keepout, overlap, cpl) uniformly.
+all the checks (arm, canary, ERC, DRC, netlist, keepout, overlap, via-in-pad, cpl) uniformly.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import arming, canary, cpl, keepout, netlist, overlap
+from . import arming, canary, cpl, keepout, netlist, overlap, viainpad
 from .project import ProjectError, discover
 from .report import Report
 
@@ -20,6 +20,7 @@ SUBCOMMANDS = {
     "canary": canary.run,
     "keepout": keepout.run,
     "overlap": overlap.run,
+    "via-in-pad": viainpad.run,
     "netlist": netlist.run,
     "cpl": cpl.run,
 }

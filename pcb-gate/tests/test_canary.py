@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pcb_gate import arming, canary, keepout, kicad_tools, netlist, sexp
+from pcb_gate import arming, canary, keepout, kicad_tools, netlist, sexp, viainpad
 from pcb_gate.report import Report
 from tests.conftest import footprint, pad, segment, via, zone_pour
 
@@ -465,4 +465,81 @@ def test_harness_passes_when_checkers_fire_as_expected(project_factory):
         arm_runner=_stub_arm_runner(fires=True),
     )
 
+    assert report.ok, report.violations
+
+
+# --- SVW-0082: via-in-pad canaries (RULE 10.2) ---------------------------
+
+
+def _land(ref="U1", number="1", net="/A", at=(10, 10)):
+    return footprint(ref, at, [pad(number, "smd", "rect", (0, 0), (1, 1), net, f"pad-{ref}", layers=("F.Cu", "F.Mask"))])
+
+
+def _harness(files, **kwargs):
+    def working_drc_runner(pcb_file: Path, report_path: Path):
+        return _firing_drc_result()
+
+    return canary.run(
+        files,
+        drc_runner=working_drc_runner,
+        keepout_checker=keepout.run,
+        parity_runner=lambda pcb, out: kicad_tools.DrcResult(
+            exit_code=5, stdout="", stderr="", report={"violations": [], "schematic_parity": [{"type": "missing_footprint"}]}
+        ),
+        netlist_runner=_stub_netlist_runner(fires=True),
+        arm_runner=_stub_arm_runner(fires=True),
+        **kwargs,
+    )
+
+
+def test_inject_via_in_pad_lands_inside_the_pad_on_the_pad_net():
+    root = ["kicad_pcb", ["layers", ["0", sexp.qstr("F.Cu"), "signal"]], _land()]
+    assert canary.inject_via_in_pad(root, set(), declared=False) is True
+    injected = root[-1]
+    assert sexp.tag(injected) == "via"
+    assert sexp.text_of(sexp.child(injected, "net")) == "/A"
+    at = sexp.child(injected, "at")
+    assert abs(float(at[1]) - 10) < 0.5 and abs(float(at[2]) - 10) < 0.5
+
+
+def test_inject_via_in_pad_skips_a_declared_pad():
+    root = ["kicad_pcb", ["layers", ["0", sexp.qstr("F.Cu"), "signal"]], _land()]
+    assert canary.inject_via_in_pad(root, {("U1", "1")}, declared=False) is False
+
+
+def test_via_in_pad_canary_fires_with_the_real_checker(project_factory):
+    report = _harness(project_factory(items=[_land()]))
+    assert any("'via_in_pad' fired" in c for c in report.checked)
+    assert report.ok, report.violations
+
+
+def test_via_in_pad_canary_fails_the_gate_when_it_comes_back_clean(project_factory):
+    def clean_checker(files):
+        return Report(tool="stub-via-in-pad", project=files.base_name)
+
+    report = _harness(project_factory(items=[_land()]), via_in_pad_checker=clean_checker)
+    assert any(v.code == "canary_did_not_fire" and "via_in_pad" in v.message for v in report.violations)
+
+
+def test_via_in_pad_canary_needs_a_new_hit_not_an_existing_one(project_factory):
+    # A checker that always reports the same hit must not pass the canary: this
+    # is a board already failing the check, not proof the check still fires.
+    def constant_checker(files):
+        result = Report(tool="stub-via-in-pad", project=files.base_name)
+        result.fail(viainpad.VIOLATION_CODE, "pre-existing")
+        return result
+
+    report = _harness(project_factory(items=[_land()]), via_in_pad_checker=constant_checker)
+    assert any(v.code == "canary_did_not_fire" and "via_in_pad" in v.message for v in report.violations)
+
+
+def test_declared_pad_canary_proves_the_allowance_is_a_count(project_factory):
+    files = project_factory(
+        items=[_land(), via((10, 10), 0.6, 0.3, "/A", "via-1"), _land(ref="U2", net="/B", at=(30, 30))],
+        capability_overrides={
+            "declared_vias_in_pads": [{"ref": "U1", "pad": '"1"', "vias": 1, "reason": "exposed-pad thermal via, plugged"}]
+        },
+    )
+    report = _harness(files)
+    assert any("'via_in_pad_declared' fired" in c for c in report.checked)
     assert report.ok, report.violations

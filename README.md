@@ -30,12 +30,13 @@ violation:
 | Step | Implements | What it does |
 |---|---|---|
 | **Arm** (`pcb-gate arm`) | RULE 1.2 / GATE 2 | Reads the project's `.kicad_pro` and asserts every netclass clearance/track width is non-zero, the board's rule floors are set, `pcb-capability.yml` exists and is fresh (≤180 days), any DRC exclusion present is declared in `pcb-capability.yml`, and — as of SVW-0038 — **no DRC or ERC check anywhere in the project has severity `ignore` unless explicitly declared** in `pcb-capability.yml`'s `declared_severity_downgrades` with a written reason. This closed-world form replaced an enumerated allowlist (SVW-0037 Defect 3: a check absent from an enumerated list is never asserted, and fails open the moment KiCad adds a new one). |
-| **Canary** (`pcb-gate canary`) | GATE 1 | Injects one known defect at a time into a throwaway copy of the board (a same-layer short, a below-minimum track width, a deleted connection, a via inside the configured keepout rule area, a footprint deleted so the board no longer matches the schematic, a falsified `.kicad_dru` assertion, a moved connectivity-lock node, an undeclared `ignore` severity) and confirms the relevant checker reports it. If a canary comes back clean, the gate itself is broken — exits non-zero naming which one. |
+| **Canary** (`pcb-gate canary`) | GATE 1 | Injects one known defect at a time into a throwaway copy of the board (a same-layer short, a below-minimum track width, a deleted connection, a via inside the configured keepout rule area, a same-net via inside a solderable land, an extra via in a declared pad, a footprint deleted so the board no longer matches the schematic, a falsified `.kicad_dru` assertion, a moved connectivity-lock node, an undeclared `ignore` severity) and confirms the relevant checker reports it. If a canary comes back clean, the gate itself is broken — exits non-zero naming which one. |
 | **ERC** (`kicad-cli sch erc`) | GATE 4 / RULE 8.3 | Schematic electrical rules, `--severity-all`, adjudicated from the JSON report (SVW-0043): any violation not marked excluded fails; an excluded entry passes here but is printed loudly, and **Arm fails any ERC exclusion not declared in `pcb-capability.yml` `declared_exclusions`** — the exclusion-with-reason is the committed decision, the raw `--exit-code-violations` flag (which counted excluded entries) is not used. |
 | **DRC** (`kicad-cli pcb drc`) | GATE 4 | Board design rules: `--severity-all --exit-code-violations --all-track-errors --schematic-parity --refill-zones`. All three of GATE 4's required checks (violations, unconnected items, schematic parity), at full reporting completeness, against freshly-filled zones — a script that reads only violations is reporting on a fraction of the board (SVW-0037 Defect 1).As of SVW-0043 the exit status comes from JSON adjudication (violations + unconnected + parity, excluded entries pass-but-print; Arm validates the declarations), not `--exit-code-violations`. |
 | **Netlist** (`pcb-gate netlist`) | GATE 15 / §16 (SVW-0038) | Every other connectivity check above is point-in-time — none of them compare this commit's connectivity to the last reviewed one, so a net swap (e.g. a pin moved from `UART_TX` to `UART_RX`) passes all of them. This step regenerates `connectivity.lock.json` from `kicad-cli sch export netlist` and fails on any difference the commit doesn't already contain, with a readable diff (nets/nodes/components added, removed, or moved). A missing lock file is a blocking failure, not a skip. |
 | **Keepout** (`pcb-gate keepout`) | GATE 6 | `kicad-cli` does not enforce rule areas from the CLI at all. This checker parses the caller-configured rule area(s) (`keepout_zone_name`, default `ANT_KEEPOUT`; comma-separated list accepted) directly and tests every track, via, pad, and **filled zone pour** on every copper layer for intersection — the filled-pour case is the actual "copper poured into the antenna clearance" failure and the reason this check exists. A board that declares `rf_board: true` and has no matching rule area **fails** (`missing_keepout_on_rf_board`) rather than skipping — SVW-0037 Defect 2: a hard-coded name match meant a real board's non-default keepout zone skipped silently, and the skip printed identically to a pass. Refills zones in a throwaway copy first (`kicad-cli pcb drc --refill-zones`) so stale committed fills don't hide a live intrusion; if `kicad-cli` is unavailable it falls back to the committed fill and says so loudly (a GATE 12 human-review item). |
 | **Overlap** (`pcb-gate overlap`) | GATE 5 / RULE 8.1 | Independent same-layer clearance check. Uses this package's own hand-rolled `.kicad_pcb` parser (`sexp.py`) and `shapely` — no `pcbnew`, no `kiutils`, nothing from KiCad's DRC engine — so a regression in the project's own rule configuration can't silently re-hide a short. Pad shapes are exact for circle/oval/rect/**roundrect** (SVW-0044 — a proper rounded rectangle via `box(...).buffer(radius, join_style="round")`, `radius = roundrect_rratio * min(sx, sy)` per KiCad's own definition; fixed after mansio-pcb's spin-2 board showed 24 false `overlap_clearance` hits against 0805/SOD-323 pads, KiCad's default roundrect shape for both footprint families, and spin-1 showed the same class with 9). **trapezoid/custom pads still use a conservative bounding-rectangle stand-in** — that remaining gap is the expected source of any first-run disagreement with KiCad DRC (net-ties, non-roundrect pad shapes), root-caused in writing per RULE 8.1, never suppressed. Pad transforms use KiCad's y-down rotation convention (SVW-0043; the y-up form evaluated every rotated footprint's pads at mirrored phantom positions). |
+| **Via-in-pad** (`pcb-gate via-in-pad`) | RULE 10.2 (SVW-0082) | A same-net via inside a pad is legal copper, so ERC, DRC and Overlap all pass it while solder wicks down the barrel and off the joint. This checker fails any via whose drill or annulus overlaps a solderable land on a layer they share, naming ref, pad, net and coordinates. A land is any non-NPTH pad with outer copper and a mask opening on the same side. An intentional via, such as an exposed-pad thermal via, passes only when declared per pad in `pcb-capability.yml` `declared_vias_in_pads`; there is no automatic exemption. |
 | **CPL / BOM** (`pcb-gate cpl`) | SVW-0070 | Runs after the Gerber/drill export and before upload. Generates the JLCPCB assembly outputs (see below) and **fails the gate** unless (1) the BOM designator set equals the CPL designator set, (2) every CPL row (position, side, rotation) matches an **independent re-derivation** from the `.kicad_pcb` — a pure parse that shares no code with `kicad-cli pcb export pos` — within 0.01 mm / 0.1°, and (3) a built-in canary proves both comparisons can fail: a footprint moved 1 mm and a BOM row dropped, each in a throwaway copy, must each be detected (RULE 1.1). |
 
 ### JLCPCB assembly outputs (SVW-0070)
@@ -164,6 +165,11 @@ declared_severity_downgrades:  # optional; empty/omit if none (SVW-0038 RULE 1.2
   - check: footprint_type_mismatch
     severity: ignore
     reason: DevKit carrier footprints intentionally mismatched; see docs/<board>-notes.md
+declared_vias_in_pads:         # optional; empty/omit if none (SVW-0082 RULE 10.2)
+  - ref: U2
+    pad: "17"                  # quoted: pad numbers are strings
+    vias: 1                    # exact count, not a ceiling
+    reason: exposed-pad ground via per the datasheet; plugged at the fab
 ```
 
 Every DRC or ERC check whose severity is `ignore` must appear here with a real reason,
@@ -171,6 +177,13 @@ or `pcb-gate arm` fails (`undeclared_ignored_severity`) — a closed-world asser
 an enumerated list, so a check KiCad adds next release is covered the day it ships. A
 placeholder reason (`TBD`, empty, etc.) fails just as loudly
 (`placeholder_severity_downgrade_reason`) — the declaration is the review.
+
+`declared_vias_in_pads` is the only way a via may sit in a solderable land, and
+`pcb-gate via-in-pad` holds it to exactly what it says: more vias than `vias`
+fail, fewer fail as stale (`stale_via_in_pad_declaration`), and a via on a
+different net from the pad fails even when declared. Nothing is exempt by pad
+size, name or net. RULE 10.2 still applies to a declared via: plug or tent it,
+and record the treatment with the assembler (RULE 10.1).
 
 ## Running locally before pushing
 
@@ -184,6 +197,7 @@ pcb-gate netlist --project-dir hardware/YourBoardName           # verify only, n
 pcb-gate keepout --project-dir hardware/YourBoardName \
   --keepout-zone-name ANT_KEEPOUT --rf-board
 pcb-gate overlap --project-dir hardware/YourBoardName
+pcb-gate via-in-pad --project-dir hardware/YourBoardName
 pcb-gate cpl --project-dir hardware/YourBoardName --out-dir jlc   # needs kicad-cli; add --cpl-include-tht for THT
 ```
 
