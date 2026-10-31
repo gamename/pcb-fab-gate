@@ -103,6 +103,14 @@ def make_capability_yml(tmp_path: Path, **overrides) -> Path:
             lines.append(f"  - check: {entry['check']}")
             lines.append(f"    severity: {entry.get('severity', 'ignore')}")
             lines.append(f"    reason: {entry['reason']}")
+    vias_in_pads = overrides.get("declared_vias_in_pads")
+    if vias_in_pads:
+        lines.append("declared_vias_in_pads:")
+        for entry in vias_in_pads:
+            lines.append(f"  - ref: {entry['ref']}")
+            lines.append(f"    pad: {entry['pad']}")
+            lines.append(f"    vias: {entry['vias']}")
+            lines.append(f"    reason: {entry['reason']}")
     path = tmp_path / "pcb-capability.yml"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path

@@ -54,6 +54,20 @@ class DeclaredSeverityDowngrade:
 
 
 @dataclass(frozen=True)
+class DeclaredViaInPad:
+    """RULE 10.2 (SVW-0082): a reviewed via inside one solderable pad, e.g. an exposed-pad thermal via.
+
+    `pad` is a string because pad numbers are ("17", "A1"), and YAML reads a bare
+    17 as an integer. `vias` is exact - see viainpad.py.
+    """
+
+    ref: str
+    pad: str
+    vias: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class Capability:
     fab: str
     retrieved: datetime.date
@@ -62,6 +76,7 @@ class Capability:
     constraints: dict[str, float]
     declared_exclusions: tuple[DeclaredExclusion, ...] = field(default_factory=tuple)
     declared_severity_downgrades: tuple[DeclaredSeverityDowngrade, ...] = field(default_factory=tuple)
+    declared_vias_in_pads: tuple[DeclaredViaInPad, ...] = field(default_factory=tuple)
 
     def age_days(self, today: datetime.date) -> int:
         return (today - self.retrieved).days
@@ -71,6 +86,26 @@ class Capability:
 
     def declared_severity_downgrades_by_check(self) -> dict[str, DeclaredSeverityDowngrade]:
         return {d.check: d for d in self.declared_severity_downgrades}
+
+
+def _load_vias_in_pads(capability_file: Path, entries: list[dict]) -> tuple[DeclaredViaInPad, ...]:
+    declared = []
+    for entry in entries:
+        missing = [k for k in ("ref", "pad", "vias", "reason") if k not in entry]
+        if missing:
+            raise CapabilityError(
+                f"{capability_file}: declared_vias_in_pads entry {entry!r} missing: {', '.join(missing)}"
+            )
+        if not isinstance(entry["vias"], int) or isinstance(entry["vias"], bool) or entry["vias"] < 1:
+            raise CapabilityError(
+                f"{capability_file}: declared_vias_in_pads 'vias' must be a positive integer, got {entry['vias']!r}"
+            )
+        declared.append(
+            DeclaredViaInPad(
+                ref=str(entry["ref"]), pad=str(entry["pad"]), vias=entry["vias"], reason=str(entry["reason"])
+            )
+        )
+    return tuple(declared)
 
 
 def load(capability_file: Path) -> Capability:
@@ -127,4 +162,5 @@ def load(capability_file: Path) -> Capability:
         constraints={k: float(v) for k, v in constraints.items()},
         declared_exclusions=exclusions,
         declared_severity_downgrades=downgrades,
+        declared_vias_in_pads=_load_vias_in_pads(capability_file, raw.get("declared_vias_in_pads") or []),
     )

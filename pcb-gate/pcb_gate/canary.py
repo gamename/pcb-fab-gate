@@ -18,7 +18,8 @@ import uuid as uuid_mod
 from pathlib import Path
 from typing import Callable
 
-from . import arming, keepout, kicad_tools, sexp
+from . import arming, keepout, kicad_tools, sexp, viainpad
+from . import capability as capability_mod
 from . import netlist as netlist_mod
 from .layers import pad_geometry
 from .project import ProjectFiles, discover
@@ -26,6 +27,7 @@ from .report import Report
 
 DrcRunner = Callable[[Path, Path], kicad_tools.DrcResult]
 KeepoutChecker = Callable[[ProjectFiles], Report]
+ViaInPadChecker = Callable[[ProjectFiles], Report]
 NetlistRunner = Callable[[ProjectFiles, bool], Report]
 ArmRunner = Callable[[ProjectFiles], Report]
 
@@ -192,6 +194,34 @@ def inject_via_in_keepout(root: sexp.Node, zone: sexp.Node) -> bool:
         ["drill", "0.3"],
         ["layers", sexp.qstr("F.Cu"), sexp.qstr("B.Cu")],
         ["net", sexp.qstr(non_rf_net)],
+        ["uuid", _new_uuid()],
+    ]
+    root.append(via)
+    return True
+
+
+def inject_via_in_pad(root: sexp.Node, keys: set[tuple[str, str]], *, declared: bool) -> bool:
+    """Canary (RULE 10.2): place a same-net via inside a solderable land.
+
+    Same net, because that is the defect DRC can't see: a via on any other net
+    would also be a short. With declared=False the target is a land not in
+    `keys`; with declared=True it is one that is, which proves a declaration
+    allows only the vias it counts.
+    """
+    throwaway = Report(tool="canary", project="canary")
+    lands = viainpad.collect_lands(root, throwaway)
+    target = next((land for land in lands if land.net and (land.key in keys) == declared), None)
+    if target is None:
+        return False
+
+    point = target.geom.representative_point()
+    via = [
+        "via",
+        ["at", str(point.x), str(point.y)],
+        ["size", "0.6"],
+        ["drill", "0.3"],
+        ["layers", sexp.qstr("F.Cu"), sexp.qstr("B.Cu")],
+        ["net", sexp.qstr(target.net)],
         ["uuid", _new_uuid()],
     ]
     root.append(via)
@@ -419,6 +449,43 @@ def _run_keepout_canary(
             report.check(f"canary '{key}' fired as expected (keepout checker reported a violation)")
 
 
+def _via_in_pad_count(result: Report) -> int:
+    return sum(1 for v in result.violations if v.code == viainpad.VIOLATION_CODE)
+
+
+def _run_via_in_pad_canary(
+    report: Report, files: ProjectFiles, checker: ViaInPadChecker, key: str, description: str, *, declared: bool
+) -> None:
+    """Fires only on a NEW `via_in_pad` hit, so a board already failing this check can't pass the canary for free."""
+    with tempfile.TemporaryDirectory(prefix="pcb-gate-canary-via-in-pad-") as tmp:
+        copy_files = _copy_project(files, Path(tmp) / "project")
+        try:
+            cap = capability_mod.load(copy_files.capability_file)
+        except capability_mod.CapabilityError as exc:
+            report.skip(f"canary '{key}': {exc}", blocking=True)
+            return
+        declared_keys = {(entry.ref, entry.pad) for entry in cap.declared_vias_in_pads}
+        if declared and not declared_keys:
+            report.skip(f"canary '{key}' ({description}): no declared_vias_in_pads on this board")
+            return
+
+        baseline = _via_in_pad_count(checker(copy_files))
+        root = sexp.parse_file(copy_files.pcb_file)
+        if not inject_via_in_pad(root, declared_keys, declared=declared):
+            report.skip(f"canary '{key}' ({description}): no eligible solderable land on this board")
+            return
+        sexp.dump_file(copy_files.pcb_file, root)
+
+        report.check(f"canary '{key}': {description}")
+        if _via_in_pad_count(checker(copy_files)) > baseline:
+            report.check(f"canary '{key}' fired as expected (via-in-pad checker reported the injected via)")
+        else:
+            report.fail(
+                "canary_did_not_fire",
+                f"canary '{key}' ({description}) came back clean - the via-in-pad checker is broken.",
+            )
+
+
 def _run_parity_canary(report: Report, files: ProjectFiles, parity_runner: DrcRunner) -> None:
     """Defect 1: prove `--schematic-parity` can actually fail before it's trusted.
 
@@ -467,6 +534,7 @@ def run(
     keepout_zone_names: list[str] | None = None,
     netlist_runner: NetlistRunner = netlist_mod.run,
     arm_runner: ArmRunner = arming.run,
+    via_in_pad_checker: ViaInPadChecker = viainpad.run,
 ) -> Report:
     report = Report(tool="pcb-gate canary", project=files.base_name)
     zone_names = list(keepout_zone_names) if keepout_zone_names else [keepout.KEEPOUT_ZONE_NAME]
@@ -485,6 +553,14 @@ def run(
         inject_delete_connection, {"unconnected_items"}, drc_runner,
     )
     _run_keepout_canary(report, files, checker, zone_names)
+    _run_via_in_pad_canary(
+        report, files, via_in_pad_checker, "via_in_pad", "place a same-net via inside a solderable land",
+        declared=False,
+    )
+    _run_via_in_pad_canary(
+        report, files, via_in_pad_checker, "via_in_pad_declared", "add an extra via to a declared pad",
+        declared=True,
+    )
     _run_dru_canary(report, files, drc_runner)
     _run_parity_canary(report, files, parity_runner)
     _run_netlist_canary(report, files, netlist_runner)
