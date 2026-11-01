@@ -3,7 +3,7 @@
 Every subcommand discovers the project, runs its check, prints what it
 checked, writes a JSON report, and exits non-zero on any violation - the
 same contract `kicad-cli pcb drc` already follows, so the workflow can treat
-all the checks (arm, canary, ERC, DRC, netlist, keepout, overlap, via-in-pad, cpl) uniformly.
+all the checks (arm, canary, ERC, DRC, netlist, keepout, overlap, via-in-pad, cpl, version) uniformly.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import arming, canary, cpl, keepout, netlist, overlap, viainpad
+from . import arming, canary, cpl, keepout, netlist, overlap, version, viainpad
 from .project import ProjectError, discover
 from .report import Report
 
@@ -23,6 +23,7 @@ SUBCOMMANDS = {
     "via-in-pad": viainpad.run,
     "netlist": netlist.run,
     "cpl": cpl.run,
+    "version": version.run,
 }
 
 # Defect 2 (Task 2): both `keepout` and `canary` need to agree on which rule
@@ -37,6 +38,8 @@ RF_BOARD_SUBCOMMANDS = {"keepout"}
 WRITE_SUBCOMMANDS = {"netlist"}
 # SVW-0070: `cpl` generates the JLCPCB BOM + CPL into --out-dir and checks them.
 CPL_SUBCOMMANDS = {"cpl"}
+# Optional hardware semver: the version file and the silkscreen must agree.
+VERSION_SUBCOMMANDS = {"version"}
 
 
 def _default_report_path(project_dir: Path, subcommand: str) -> Path:
@@ -83,6 +86,9 @@ def main(argv: list[str] | None = None) -> int:
                 help="Include through-hole footprints (default: SMD only)",
             )
 
+        if name in VERSION_SUBCOMMANDS:
+            sub.add_argument("--version-file", required=True, help="File holding MAJOR.MINOR.PATCH")
+
     args = parser.parse_args(argv)
 
     try:
@@ -103,6 +109,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.subcommand in CPL_SUBCOMMANDS:
         kwargs["out_dir"] = args.out_dir
         kwargs["include_tht"] = args.cpl_include_tht
+
+    if args.subcommand in VERSION_SUBCOMMANDS:
+        kwargs["version_file"] = args.version_file
 
     report: Report = check_fn(files, **kwargs)
 

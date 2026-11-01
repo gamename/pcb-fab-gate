@@ -125,6 +125,13 @@ jobs:
       rf_board: false                 # true fails (not skips) the gate when no matching keepout zone is found
 ```
 
+**Optional hardware semver (`version_file`, `release_name`).** Set both to name
+releases `<release_name>-vMAJOR.MINOR.PATCH` instead of `fab-<prefix>-NNNN-<sha>`.
+The gate fails unless the file holds plain semver and the silkscreen prints the
+same `vMAJOR.MINOR.PATCH` in board text, and a PR that changes `project_dir`
+under an already released version fails until the file is bumped. Boards that
+set neither keep the old name. Add the version file to the caller's `paths`.
+
 **Tag policy — `v1` is a moving pointer, not a version.** It always points
 at the latest `v1.x.y` release so existing callers keep getting non-breaking
 fixes without a PR. That is exactly the property SVW-0037 exists to warn
