@@ -112,6 +112,16 @@ on:
         required: false
         type: boolean
         default: false
+      version_file:
+        description: "Optional hardware semver: repo-relative path to a file holding MAJOR.MINOR.PATCH. When set with release_name, the release tag is <release_name>-v<version>, assets are named from it, and the silkscreen must print v<version>. Empty keeps the fab-<prefix>-NNNN-<sha> tag."
+        required: false
+        type: string
+        default: ""
+      release_name:
+        description: "Release name stem used with version_file, e.g. mh2-egg-carrier."
+        required: false
+        type: string
+        default: ""
       cpl_include_tht:
         description: "SVW-0070: include through-hole footprints in the JLCPCB CPL and assembly BOM. Default false = SMD only (through-hole parts are normally hand-soldered, not placed by the assembler)."
         required: false
@@ -310,6 +320,12 @@ jobs:
         run: |
           pcb-gate via-in-pad --project-dir "${{ inputs.project_dir }}" --report viainpad.json
 
+      - name: Version (silkscreen matches the version file)
+        if: always() && inputs.version_file != ''
+        run: |
+          pcb-gate version --project-dir "${{ inputs.project_dir }}" \
+            --version-file "${{ inputs.version_file }}" --report version.json
+
       - name: Upload check reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -324,6 +340,7 @@ jobs:
             keepout.json
             overlap.json
             viainpad.json
+            version.json
           if-no-files-found: warn
 
       - name: Export gerbers + drill
@@ -400,9 +417,45 @@ jobs:
           path: bom_raw.csv
           if-no-files-found: warn
 
+  version-check:
+    # Runs for every caller and passes straight through without version_file,
+    # so the release job can need it unconditionally. A version names one board:
+    # changing the board under a released version fails here, on the PR.
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Refuse to reuse a released version
+        id: check
+        env:
+          VERSION_FILE: ${{ inputs.version_file }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+          PROJECT_DIR: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VERSION_FILE" ]; then
+            exit 0
+          fi
+          if [ -z "$RELEASE_NAME" ]; then
+            echo "version_file needs release_name" >&2
+            exit 1
+          fi
+          tag="${RELEASE_NAME}-v$(tr -d '[:space:]' < "$VERSION_FILE")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          git fetch -q --tags origin
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            if ! git diff --quiet "$tag" HEAD -- "$PROJECT_DIR"; then
+              echo "$tag is already released and $PROJECT_DIR has changed: bump $VERSION_FILE" >&2
+              exit 1
+            fi
+          fi
+
   release:
     name: Publish fab release
-    needs: fab-gate
+    needs: [fab-gate, version-check]
     # Release only on a push to the default branch, in the same run that
     # produced the gated artifact — never on PRs, never on other branches.
     if: >-
@@ -442,9 +495,16 @@ jobs:
           num="${num%]}"
           prefix_lower=$(printf '%s' "$id_prefix" | tr '[:upper:]' '[:lower:]')
           short_sha="${GITHUB_SHA:0:7}"
+          tag="${{ needs.version-check.outputs.tag }}"
+          semver=true
+          if [ -z "$tag" ]; then
+            tag="fab-${prefix_lower}-${num}-${short_sha}"
+            semver=false
+          fi
           {
             echo "short_sha=$short_sha"
-            echo "tag=fab-${prefix_lower}-${num}-${short_sha}"
+            echo "tag=$tag"
+            echo "semver=$semver"
             echo "subject=$(printf '%s' "$tagged_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
           } >> "$GITHUB_OUTPUT"
 
@@ -547,6 +607,9 @@ jobs:
         run: |
           set -euo pipefail
           zip_name="${{ needs.fab-gate.outputs.base_name }}-${{ steps.rel.outputs.tag }}.zip"
+          if [ "${{ steps.rel.outputs.semver }}" = "true" ]; then
+            zip_name="${{ steps.rel.outputs.tag }}.zip"
+          fi
           (cd fab-package && zip -rq "../$zip_name" .)
           echo "zip_name=$zip_name" >> "$GITHUB_OUTPUT"
 
@@ -571,6 +634,9 @@ jobs:
           # has Manufacturer/MPN fields (steps.digikey.outputs.has_bom).
           if [ "${{ steps.digikey.outputs.has_bom }}" = "true" ]; then
             digikey_name="${{ needs.fab-gate.outputs.base_name }}-DigikeyBom-${{ steps.rel.outputs.tag }}.csv"
+            if [ "${{ steps.rel.outputs.semver }}" = "true" ]; then
+              digikey_name="${{ steps.rel.outputs.tag }}-DigikeyBom.csv"
+            fi
             mv digikey_bom.csv "$digikey_name"
             echo "digikey_name=$digikey_name" >> "$GITHUB_OUTPUT"
           fi
@@ -585,10 +651,16 @@ jobs:
           set -euo pipefail
           base="${{ needs.fab-gate.outputs.base_name }}"
           tag="${{ steps.rel.outputs.tag }}"
-          mv jlc/jlc_cpl.csv "$base-JlcCpl-$tag.csv"
-          mv jlc/jlc_bom.csv "$base-JlcBom-$tag.csv"
-          echo "cpl_name=$base-JlcCpl-$tag.csv" >> "$GITHUB_OUTPUT"
-          echo "bom_name=$base-JlcBom-$tag.csv" >> "$GITHUB_OUTPUT"
+          cpl_name="$base-JlcCpl-$tag.csv"
+          bom_name="$base-JlcBom-$tag.csv"
+          if [ "${{ steps.rel.outputs.semver }}" = "true" ]; then
+            cpl_name="$tag-JlcCpl.csv"
+            bom_name="$tag-JlcBom.csv"
+          fi
+          mv jlc/jlc_cpl.csv "$cpl_name"
+          mv jlc/jlc_bom.csv "$bom_name"
+          echo "cpl_name=$cpl_name" >> "$GITHUB_OUTPUT"
+          echo "bom_name=$bom_name" >> "$GITHUB_OUTPUT"
           echo "lcsc_note=$(jq -r .note jlc/jlc_summary.json)" >> "$GITHUB_OUTPUT"
 
       - name: Compose release notes
@@ -627,6 +699,9 @@ jobs:
             check_line "Keepout (GATE 6)" "keepout.json"
             check_line "Overlap (GATE 5)" "overlap.json"
             check_line "Via-in-pad (RULE 10.2)" "viainpad.json"
+            if [ -f reports/version.json ]; then
+              check_line "Version (silkscreen)" "version.json"
+            fi
             check_line "CPL/BOM (SVW-0070)" "../jlc/cpl.json"
             echo
             echo "**JLCPCB assembly outputs:** \`${{ steps.jlcnames.outputs.cpl_name }}\` + \`${{ steps.jlcnames.outputs.bom_name }}\` — ${{ steps.jlcnames.outputs.lcsc_note }}. Orientation is not CI-checkable: compare JLCPCB's placement preview against the 3D view before ordering (pcb-prefab-review)."
