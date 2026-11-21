@@ -397,7 +397,8 @@ jobs:
         # quantity and a ref range (e.g. "F1-F3"). Boards without Manufacturer
         # /MPN fields on their symbols still succeed here — every row just
         # comes back with an empty MPN column, which the release job uses as
-        # its skip signal (see build_digikey_bom.py).
+        # its skip signal (see build_digikey_bom.py). --exclude-dnp keeps DNP
+        # symbols off the purchase list (SVW-125).
         id: bom
         if: success()
         run: |
@@ -406,6 +407,7 @@ jobs:
             --fields "Reference,QUANTITY,Manufacturer,MPN,Value,Description" \
             --labels "Refs,Qty,Manufacturer,MPN,Value,Description" \
             --group-by "MPN" \
+            --exclude-dnp \
             -o bom_raw.csv \
             "${{ steps.discover.outputs.sch_file }}"
 
